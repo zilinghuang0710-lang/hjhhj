@@ -30,7 +30,7 @@ USER_AGENTS = [
 
 def create_session():
     session = requests.Session()
-    retry = urllib3.util.retry.Retry(total=1, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+    retry = urllib3.util.retry.Retry(total=1, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504])
     adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_connections=150, pool_maxsize=150)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
@@ -40,19 +40,21 @@ def create_session():
 
 http_session = create_session()
 
-# ================== 活跃股票池（双源 + 3000只兜底） ==================
-def generate_fallback_stocks():
-    """生成全量A股兜底，严格控制代码段避免大面积死代码"""
-    stocks = []
-    # 深市 000001-001000
-    for i in range(1, 1001): stocks.append({"code": f"{i:06d}", "name": f"深A_{i:06d}", "sector": "兜底"})
-    # 沪市 600000-601000
-    for i in range(600000, 601000): stocks.append({"code": str(i), "name": f"沪A_{i}", "sector": "兜底"})
-    # 创业板 300001-301000
-    for i in range(300001, 301001): stocks.append({"code": str(i), "name": f"创业板_{i}", "sector": "兜底"})
-    
-    # 随机打乱：防止扫描时卡在连续的死代码区段（极其关键！）
-    random.shuffle(stocks)
+# ================== 活跃股票池（双源 + 真实白马股兜底防止死代码卡网） ==================
+def get_hardcoded_fallback_stocks():
+    """使用真实的活跃资产作为兜底，彻底防止死代码打穿网络连接池"""
+    codes = [
+        ("000001", "平安银行"), ("000002", "万科A"), ("000063", "中兴通讯"), ("000100", "TCL科技"),
+        ("000538", "云南白药"), ("000725", "京东方A"), ("000858", "五粮液"), ("002230", "科大讯飞"),
+        ("002304", "洋河股份"), ("002400", "省广集团"), ("002415", "海康威视"), ("002475", "立讯精密"),
+        ("002594", "比亚迪"), ("002714", "牧原股份"), ("300014", "亿纬锂能"), ("300015", "爱尔眼科"),
+        ("300059", "东方财富"), ("300124", "汇川技术"), ("300274", "阳光电源"), ("300750", "宁德时代"),
+        ("600000", "浦发银行"), ("600030", "中信证券"), ("600036", "招商银行"), ("600104", "上汽集团"),
+        ("600276", "恒瑞医药"), ("600519", "贵州茅台"), ("600900", "长江电力"), ("601012", "隆基绿能"),
+        ("601166", "兴业银行"), ("601318", "中国平安"), ("601888", "中国中免"), ("688981", "中芯国际")
+    ]
+    stocks = [{"code": c[0], "name": c[1], "volume_ratio": 1.0, "sector": "核心资产"} for c in codes]
+    random.shuffle(stocks) # 随机打乱
     return stocks
 
 def get_active_stocks(limit=400):
@@ -70,7 +72,7 @@ def get_active_stocks(limit=400):
             "fid": "f20", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
             "fields": "f12,f14,f10,f20,f100", "_": str(int(now*1000))
         }
-        resp = http_session.get(url, params=params, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=3).json()
+        resp = http_session.get(url, params=params, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=4).json()
         if resp and resp.get("data") and resp["data"].get("diff"):
             for item in resp["data"]["diff"]:
                 code, name = item.get("f12"), item.get("f14")
@@ -81,7 +83,7 @@ def get_active_stocks(limit=400):
     if len(stocks) < 50:
         try:
             tx_url = "https://web.ifzq.gtimg.cn/appstock/app/rank/total?type=1&num=200"
-            tx_data = http_session.get(tx_url, timeout=3).json()
+            tx_data = http_session.get(tx_url, timeout=4).json()
             if tx_data and tx_data.get("data"):
                 for stock in tx_data["data"].get("stocks", []):
                     code, name = stock.get("code"), stock.get("name")
@@ -89,18 +91,11 @@ def get_active_stocks(limit=400):
                         stocks.append({"code": code, "name": name, "volume_ratio": 1.0, "sector": ""})
         except: pass
 
+    # 终极兜底
     if not stocks:
-        stocks = generate_fallback_stocks()
-        limit = max(limit, 3000)
+        stocks = get_hardcoded_fallback_stocks()
         
-    # 去重并缓存
-    unique_stocks = []
-    seen = set()
-    for s in stocks:
-        if s['code'] not in seen:
-            seen.add(s['code'])
-            unique_stocks.append(s)
-            
+    unique_stocks = list({s['code']: s for s in stocks}.values())
     active_cache["data"] = unique_stocks
     active_cache["time"] = now
     return unique_stocks[:limit]
@@ -111,16 +106,16 @@ def resolve_stock_input(keyword):
     if re.match(r'^\d{6}$', keyword): return keyword, f"A股_{keyword}"
     try:
         resp = http_session.get("https://searchapi.eastmoney.com/api/suggest/get", params={
-            "input":keyword,"type":"14","token":"D43BF722C8E33BDC906FB84D85E326E8","count":"1"}, timeout=2)
+            "input":keyword,"type":"14","token":"D43BF722C8E33BDC906FB84D85E326E8","count":"1"}, timeout=3)
         if resp.status_code==200:
             data = resp.json()
             if data and data.get("QuotationCodeTable") and data["QuotationCodeTable"]["Data"]:
                 item = data["QuotationCodeTable"]["Data"][0]
                 return item["Code"], item["Name"]
     except: pass
-    return keyword, keyword # 匹配不到直接返回输入值盲试
+    return keyword, keyword 
 
-# ================== 核心防崩转化 ==================
+# ================== 数据安全处理 ==================
 def safe_float(val):
     try:
         v = float(val)
@@ -128,7 +123,6 @@ def safe_float(val):
     except: return 0.0
 
 def safe_date(date_str):
-    """确保日期格式为 YYYY-MM-DD，防止前端 JS 解析 NaN"""
     date_str = str(date_str).strip()
     if len(date_str) == 8 and date_str.isdigit():
         return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
@@ -161,7 +155,8 @@ class StockAnalyzer:
             "lmt": str(KLINE_LIMIT)
         }
         try:
-            resp = http_session.get(url_em, params=params_em, timeout=(1.5, 2))
+            # 宽容的连接时间，防止网络波动卡死
+            resp = http_session.get(url_em, params=params_em, timeout=(3, 5))
             if resp.status_code == 200:
                 data = resp.json()
                 if data and data.get("data") and data["data"].get("klines"):
@@ -182,7 +177,7 @@ class StockAnalyzer:
         prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
         tx_url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{self.symbol},day,,,{KLINE_LIMIT},qfq"
         try:
-            resp = http_session.get(tx_url, timeout=(1.5, 2))
+            resp = http_session.get(tx_url, timeout=(3, 5))
             if resp.status_code == 200:
                 data = resp.json()
                 if data and data.get("code") == 0:
@@ -222,10 +217,8 @@ class StockAnalyzer:
         if not recent.empty and recent['close'].max() > recent['close'].min():
             bins = np.linspace(recent['close'].min(), recent['close'].max(), 11)
             cuts = pd.cut(recent['close'], bins=bins)
-            try:
-                dist = recent.groupby(cuts, observed=False)['volume'].sum()
-            except TypeError:
-                dist = recent.groupby(cuts)['volume'].sum()
+            try: dist = recent.groupby(cuts, observed=False)['volume'].sum()
+            except TypeError: dist = recent.groupby(cuts)['volume'].sum()
             self.chip_peak = dist.idxmax().mid if not dist.empty else recent['close'].iloc[-1]
             
         df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -248,15 +241,13 @@ class StockAnalyzer:
                 df_w['D'] = df_w['K'].ewm(com=2, adjust=False).mean()
                 df_w['J'] = 3*df_w['K'] - 2*df_w['D']
                 self.df_w = df_w.replace([np.inf, -np.inf], np.nan).fillna(0)
-            else:
-                self.df_w = pd.DataFrame()
-        except:
-            self.df_w = pd.DataFrame()
+            else: self.df_w = pd.DataFrame()
+        except: self.df_w = pd.DataFrame()
             
         return True
 
     def get_full_report(self):
-        if not self.calculate_indicators(): return {"error": "数据不足或计算异常，可能是停牌或无数据股票"}
+        if not self.calculate_indicators(): return {"error": "数据不足或计算异常，可能是退市、停牌或无数据股票"}
         latest = self.df.iloc[-1]
         prev = self.df.iloc[-2]
         vol_ratio = latest['volume'] / (latest['VMA5'] if latest['VMA5'] > 0 else 1)
@@ -317,7 +308,6 @@ class StockAnalyzer:
         if latest['close'] > prev['close'] and vol_ratio > 1.3: intent = "放量启动"
         elif is_wash: intent = "缩量洗盘"
 
-        # 严格过滤 JSON 安全数据，防止图表解析崩溃
         chart_data = []
         for _, row in self.df.tail(80).iterrows():
             chart_data.append({
@@ -376,9 +366,9 @@ def analyze_single_scan(code, strategy, name, sector):
     return {"code":code, "name":name, "sector":sector, "score":score, "close":f"{latest['close']:.2f}", "advice":advice}
 
 def scan_stocks(strategy, top_n=10):
-    stocks = get_active_stocks(3000)
+    stocks = get_active_stocks(400)
     results = []
-    ex = ThreadPoolExecutor(max_workers=50) # 提速
+    ex = ThreadPoolExecutor(max_workers=50)
     futures = {ex.submit(analyze_single_scan, s["code"], strategy, s["name"], s["sector"]): s for s in stocks}
     
     try:
@@ -386,7 +376,6 @@ def scan_stocks(strategy, top_n=10):
             res = f.result()
             if res:
                 results.append(res)
-                # 熔断：找到足够多立即停止，防止3000只死股票把带宽打穿
                 if len(results) >= top_n + 5: break
     finally:
         for f in futures.keys(): f.cancel()
@@ -432,7 +421,7 @@ def analyze():
     code, name = resolve_stock_input(d.get('stock'))
     if not code: return jsonify({"error":"无法识别股票或股票不存在"})
     az = StockAnalyzer(code, name, d.get('cost'))
-    if not az.fetch_data(): return jsonify({"error":"行情获取失败，可能是退市/停牌股票或网络异常"})
+    if not az.fetch_data(): return jsonify({"error":"网络连接异常或该股票近期无数据（可能是退市/停牌）"})
     rep = az.get_full_report()
     if "error" in rep: return jsonify(rep)
     return jsonify({"report":rep})
@@ -471,43 +460,53 @@ def run_bt():
     for p in res['picks']: txt += f" {p['name']}({p['code']}) 收益:{p['profit']:+.2f}% {'✅' if p['success'] else '❌'}\n"
     return jsonify({"report": txt})
 
-# ================== 前端 UI (彻底消灭黑字与图表丢失) ==================
+# ================== 前端 UI (终极版：图表必现 + 强制白字护眼深色) ==================
 HTML = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PRO-QUANT V12 极致稳定版</title>
+    <title>PRO-QUANT V13 (图表必现修复版)</title>
     <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.bootcdn.net/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
     <style>
-        :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9; --acc:#2ea043; }
-        body { background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; }
-        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 15px; }
-        .card-header-custom { background: rgba(255,255,255,0.02); border-bottom: 1px solid var(--border); padding: 12px 15px; font-weight: bold; border-radius: 10px 10px 0 0; color:#fff; }
+        /* 严苛的高对比深色模式配色方案 */
+        body { background-color: #0f172a; color: #f8fafc; font-family: -apple-system, sans-serif; }
         
-        /* 全局强制重写表单控件颜色！彻底解决黑底黑字 */
+        .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 10px; margin-bottom: 15px; }
+        .card-header-custom { background-color: #0f172a; border-bottom: 1px solid #334155; padding: 12px 15px; font-weight: bold; border-radius: 10px 10px 0 0; color: #f8fafc; }
+        
+        /* 强制重写原生 input 和 select 的背景和字体颜色！彻底告别黑字 */
         input.form-control, select.form-select, textarea {
-            background-color: #21262d !important;
+            background-color: #334155 !important;
             color: #ffffff !important;
-            border: 1px solid #30363d !important;
+            border: 1px solid #475569 !important;
         }
-        input::placeholder { color: #8b949e !important; }
+        input::placeholder { color: #94a3b8 !important; }
         
-        .btn-primary { background: var(--acc); border: none; color: #fff;} .btn-primary:hover { background: #3fb950; }
-        .terminal-box { background: #010409; color: #39ff14; font-family: 'Consolas', monospace; padding: 15px; border-radius: 8px; border: 1px solid var(--border); font-size: 14px; white-space: pre-wrap; }
-        .metric-box { background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; color: #fff;}
-        .metric-title { color: #8b949e; font-size: 13px; }
-        .stock-card { cursor: pointer; transition: 0.2s; } .stock-card:hover { border-color: var(--acc); background: #1c2128; }
-        .text-up { color: #f85149 !important; } .text-down { color: #3fb950 !important; }
+        .btn-primary { background-color: #10b981; border: none; color: #fff;} 
+        .btn-primary:hover { background-color: #059669; }
         
-        /* 图表容器显式样式，避免高度坍塌 */
-        #chart-container { height: 450px; width: 100%; margin-top: 15px; display: block; position: relative; }
+        /* 报告输出框高亮调整 */
+        .terminal-box { background-color: #020617; color: #a7f3d0; font-family: 'Consolas', monospace; padding: 15px; border-radius: 8px; border: 1px solid #334155; font-size: 14px; white-space: pre-wrap; line-height: 1.6; }
+        
+        .metric-box { background-color: #020617; border: 1px solid #334155; border-radius: 8px; padding: 10px; text-align: center; color: #ffffff;}
+        .metric-title { color: #94a3b8; font-size: 13px; margin-bottom: 4px; }
+        
+        .stock-card { cursor: pointer; transition: 0.2s; } 
+        .stock-card:hover { border-color: #10b981; background-color: #334155; }
+        
+        .text-up { color: #ef4444 !important; } /* A股红涨 */
+        .text-down { color: #10b981 !important; } /* A股绿跌 */
+        .text-secondary-light { color: #cbd5e1 !important; }
+        
+        /* 确保图表容器不坍塌 */
+        #chart-container { height: 450px; width: 100%; margin-top: 20px; display: block; position: relative; }
     </style>
 </head>
 <body>
-<nav class="navbar navbar-dark bg-dark mb-3 border-bottom border-secondary">
-    <div class="container-fluid"><span class="navbar-brand fw-bold text-success">🛰️ PRO-QUANT V12 (完美修复白字/图表/防卡死)</span></div>
+<nav class="navbar navbar-dark mb-3 border-bottom border-secondary" style="background-color: #020617;">
+    <div class="container-fluid"><span class="navbar-brand fw-bold" style="color:#34d399;">🛰️ PRO-QUANT V13 (图表必现修复版)</span></div>
 </nav>
 
 <div class="container-fluid px-4">
@@ -518,43 +517,60 @@ HTML = '''<!DOCTYPE html>
                 <div class="card-body">
                     <input type="text" id="s_code" class="form-control mb-2" placeholder="代码/名称/拼音" value="省广集团">
                     <input type="number" step="0.01" id="s_cost" class="form-control mb-3" placeholder="持仓成本(可选)">
-                    <button class="btn btn-primary w-100" onclick="analyze()">🚀 执行侦测</button>
+                    <button class="btn btn-primary w-100 fw-bold" onclick="analyze()">🚀 执行侦测</button>
                 </div>
             </div>
+            
             <div class="card">
                 <div class="card-header-custom">📡 策略扫描</div>
                 <div class="card-body">
-                    <button class="btn btn-outline-info w-100 mb-2" onclick="scan('short')">⚡ 短线突击</button>
-                    <button class="btn btn-outline-success w-100 mb-2" onclick="scan('band')">🌊 中线波段</button>
-                    <button class="btn btn-outline-warning w-100" onclick="scan('washout')">🛁 缩量洗盘坑</button>
+                    <button class="btn btn-outline-info w-100 mb-2 text-white" onclick="scan('short')">⚡ 短线突击</button>
+                    <button class="btn btn-outline-success w-100 mb-2 text-white" onclick="scan('band')">🌊 中线波段</button>
+                    <button class="btn btn-outline-warning w-100 text-white" onclick="scan('washout')">🛁 缩量洗盘坑</button>
                 </div>
             </div>
+            
             <div class="card">
                 <div class="card-header-custom">🛠️ 资产与回测</div>
                 <div class="card-body">
                     <div id="ports" class="mb-2">
-                        <div class="d-flex gap-1 mb-1"><input class="form-control form-control-sm p_code" placeholder="代码"><input class="form-control form-control-sm p_cost" placeholder="成本"><input class="form-control form-control-sm p_weight" placeholder="仓位%"></div>
+                        <div class="d-flex gap-1 mb-1">
+                            <input class="form-control form-control-sm p_code" placeholder="代码">
+                            <input class="form-control form-control-sm p_cost" placeholder="成本">
+                            <input class="form-control form-control-sm p_weight" placeholder="仓位%">
+                        </div>
                     </div>
                     <div class="d-flex justify-content-between mb-3">
-                        <button class="btn btn-sm btn-outline-secondary" onclick="addPort()" style="color:#fff;">+加一行</button>
+                        <button class="btn btn-sm btn-outline-secondary text-white" onclick="addPort()">+加一行</button>
                         <button class="btn btn-sm btn-success" onclick="calcPort()">运算组合</button>
                     </div>
-                    <hr class="border-secondary">
-                    <select id="bt_strat" class="form-select form-select-sm mb-1"><option value="washout">洗盘策略</option><option value="short">短线策略</option><option value="band">波段策略</option></select>
+                    <hr style="border-color: #475569;">
+                    <select id="bt_strat" class="form-select form-select-sm mb-1">
+                        <option value="washout">洗盘策略</option>
+                        <option value="short">短线策略</option>
+                        <option value="band">波段策略</option>
+                    </select>
                     <input type="date" id="bt_date" class="form-control form-control-sm mb-1">
-                    <select id="bt_hold" class="form-select form-select-sm mb-2"><option value="1">持有1天</option><option value="3">持有3天</option><option value="5">持有5天</option></select>
-                    <button class="btn btn-sm btn-outline-danger w-100" onclick="runBt()">⏳ 历史回测</button>
+                    <select id="bt_hold" class="form-select form-select-sm mb-2">
+                        <option value="1">持有1天</option>
+                        <option value="3">持有3天</option>
+                        <option value="5">持有5天</option>
+                    </select>
+                    <button class="btn btn-sm btn-outline-danger w-100 text-white" onclick="runBt()">⏳ 历史回测</button>
                 </div>
             </div>
         </div>
 
         <div class="col-lg-9">
             <div class="card" style="min-height: 800px;">
-                <div class="card-header-custom d-flex justify-content-between">
-                    <span>📺 核心情报大屏</span><span id="loader" class="text-success" style="display:none;">处理中...</span>
+                <div class="card-header-custom d-flex justify-content-between align-items-center">
+                    <span>📺 核心情报大屏</span>
+                    <span id="loader" style="display:none; color:#34d399;">
+                        <div class="spinner-border spinner-border-sm mr-2" role="status"></div> 核心引擎推演中...
+                    </span>
                 </div>
                 <div class="card-body" id="displayArea">
-                    <div class="text-center text-secondary mt-5" style="color: #8b949e !important;"><h3>等待指令...</h3></div>
+                    <div class="text-center mt-5" style="color: #64748b;"><h3>等待指令...</h3></div>
                 </div>
             </div>
         </div>
@@ -569,12 +585,12 @@ HTML = '''<!DOCTYPE html>
         const stock = document.getElementById('s_code').value, cost = document.getElementById('s_cost').value;
         if(!stock) return;
         
-        // 分析前清理旧图表实例
-        if(kChart) { kChart.destroy(); kChart = null; }
+        if(kChart) { kChart.destroy(); kChart = null; } // 渲染前摧毁旧画布
         
         document.getElementById('loader').style.display = 'block';
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000); // 放宽至15秒防超时
+        const timeout = setTimeout(() => controller.abort(), 20000); // 放宽至 20 秒
+        
         try {
             const res = await fetch('/analyze', {
                 method: 'POST', headers: {'Content-Type':'application/json'},
@@ -583,53 +599,64 @@ HTML = '''<!DOCTYPE html>
             clearTimeout(timeout);
             const data = await res.json();
             document.getElementById('loader').style.display = 'none';
-            if(data.error) { document.getElementById('displayArea').innerHTML = `<div class="alert alert-danger" style="color:#fff;">❌ ${data.error}</div>`; return; }
+            
+            if(data.error) { 
+                document.getElementById('displayArea').innerHTML = `<div class="alert" style="background-color:#7f1d1d; color:#fff; border:none;">❌ ${data.error}</div>`; 
+                return; 
+            }
             
             const r = data.report;
             const color = r.change >= 0 ? 'text-up' : 'text-down';
             
-            // 构建 HTML 并注入
+            // 拼接框架，预留 <div id="chart-container"></div>
             document.getElementById('displayArea').innerHTML = `
             <div class="d-flex justify-content-between align-items-end mb-3">
-                <h3 class="text-white mb-0">${r.name} <span class="fs-6 text-secondary" style="color:#8b949e!important;">${r.code}</span></h3>
-                <h2 class="${color} mb-0">${r.price.toFixed(2)} <span class="fs-6">${r.change >= 0 ? '+'+r.change : r.change}%</span></h2>
+                <h3 class="text-white mb-0 fw-bold">${r.name} <span class="fs-6" style="color:#94a3b8;">${r.code}</span></h3>
+                <h2 class="${color} mb-0 fw-bold">${r.price.toFixed(2)} <span class="fs-6">${r.change >= 0 ? '+'+r.change : r.change}%</span></h2>
             </div>
+            
             <div class="row g-2 mb-3">
-                <div class="col-3"><div class="metric-box"><div class="metric-title">主力意图</div><div class="fw-bold text-info">${r.intent}</div></div></div>
-                <div class="col-3"><div class="metric-box"><div class="metric-title">KDJ (J值)</div><div class="fw-bold">${r.kdj.J.toFixed(1)}</div></div></div>
-                <div class="col-3"><div class="metric-box"><div class="metric-title">动能量比</div><div class="fw-bold">${r.vol_ratio.toFixed(2)}</div></div></div>
-                <div class="col-3"><div class="metric-box"><div class="metric-title">系统评分</div><div class="fw-bold text-success">${r.score}</div></div></div>
+                <div class="col-3"><div class="metric-box"><div class="metric-title">主力意图</div><div class="fw-bold" style="color:#38bdf8;">${r.intent}</div></div></div>
+                <div class="col-3"><div class="metric-box"><div class="metric-title">KDJ (J值)</div><div class="fw-bold text-white">${r.kdj.J.toFixed(1)}</div></div></div>
+                <div class="col-3"><div class="metric-box"><div class="metric-title">动能量比</div><div class="fw-bold text-white">${r.vol_ratio.toFixed(2)}</div></div></div>
+                <div class="col-3"><div class="metric-box"><div class="metric-title">系统评分</div><div class="fw-bold" style="color:#34d399;">${r.score} 分</div></div></div>
             </div>
             
             <div id="chart-container"></div>
             
             <div class="mt-4">
-                <button class="btn w-100 text-start" type="button" data-bs-toggle="collapse" data-bs-target="#textReport" aria-expanded="true" style="background-color:#21262d; border:1px solid #30363d; color:#fff;">📄 展开/折叠 深度量价诊断报告 (日线+周线)</button>
+                <button class="btn w-100 text-start" type="button" data-bs-toggle="collapse" data-bs-target="#textReport" aria-expanded="true" style="background-color:#1e293b; border:1px solid #334155; color:#f8fafc;">
+                    📄 展开/折叠 深度量价诊断报告 (日线+周线)
+                </button>
                 <div class="collapse show mt-2" id="textReport">
                     <pre class="terminal-box">${r.text_report}</pre>
                 </div>
             </div>`;
             
-            // 确保 DOM 挂载完毕后再渲染图表
-            setTimeout(() => { renderChart(r.chart_data); }, 100);
+            // 确保 DOM 框架渲染完毕后，再触发图表绘制
+            setTimeout(() => { 
+                try { renderChart(r.chart_data); } 
+                catch(err) { console.error("图表绘制错误:", err); }
+            }, 100);
             
         } catch(e) {
             clearTimeout(timeout);
             document.getElementById('loader').style.display = 'none';
-            document.getElementById('displayArea').innerHTML = '<div class="alert alert-warning" style="color:#fff;">⏰ 请求超时或异常，请检查网络或更换股票代码</div>';
+            document.getElementById('displayArea').innerHTML = `<div class="alert" style="background-color:#991b1b; color:#fff; border:none;">⏰ 请求超时或渲染崩溃: ${e.message}</div>`;
         }
     }
 
     function renderChart(data) {
         if(!data || data.length === 0) return;
         
-        // 修复日期解析导致的 NaN
-        const kLineData = data.map(i => {
-            const parsedDate = new Date(i.date.replace(/-/g, '/')).getTime();
-            return { x: isNaN(parsedDate) ? i.date : parsedDate, y: [i.open, i.high, i.low, i.close] };
-        });
-        const ma20Data = data.map(i => ({ x: new Date(i.date.replace(/-/g, '/')).getTime(), y: i.ma20 }));
-        const volData = data.map(i => ({ x: new Date(i.date.replace(/-/g, '/')).getTime(), y: i.volume, fillColor: i.close >= i.open ? 'rgba(248,81,73,0.5)' : 'rgba(63,185,80,0.5)' }));
+        // 数据清洗转换
+        const kLineData = data.map(i => ({ x: new Date(i.date).getTime(), y: [i.open, i.high, i.low, i.close] }));
+        const ma20Data = data.map(i => ({ x: new Date(i.date).getTime(), y: i.ma20 }));
+        const volData = data.map(i => ({ 
+            x: new Date(i.date).getTime(), 
+            y: i.volume, 
+            fillColor: i.close >= i.open ? 'rgba(239,68,68,0.5)' : 'rgba(16,185,129,0.5)' // 红涨绿跌
+        }));
 
         const options = {
             series: [
@@ -637,25 +664,38 @@ HTML = '''<!DOCTYPE html>
                 { name: 'MA20', type: 'line', data: ma20Data },
                 { name: '成交量', type: 'column', data: volData }
             ],
-            chart: { height: 450, type: 'line', background: 'transparent', toolbar: { show: false }, stacked: false },
+            chart: { height: 450, type: 'line', background: 'transparent', toolbar: { show: false } },
             theme: { mode: 'dark' },
             stroke: { width: [1, 2, 1], curve: 'smooth' },
-            colors: ['#fff', '#00e676', '#00e676'],
+            colors: ['#fff', '#fbbf24', '#fff'], // MA20用醒目的金黄色
             plotOptions: {
-                candlestick: { colors: { upward: '#f85149', downward: '#3fb950' }, wick: { useFillColor: true } },
-                bar: { columnWidth: '80%', borderRadius: 0 }
+                candlestick: { colors: { upward: '#ef4444', downward: '#10b981' }, wick: { useFillColor: true } },
+                bar: { columnWidth: '80%' }
             },
-            xaxis: { type: 'datetime', labels: { style: { colors: '#8b949e' } } },
+            xaxis: { type: 'datetime', labels: { style: { colors: '#94a3b8' } } },
+            
+            // 【核心修复】混合图表 3个 Series 必须完美对应 3个 Y轴配置
             yaxis: [
-                { seriesName: 'K线', title: { text: '价格', style: { color: '#8b949e' } }, labels: { style: { colors: '#8b949e' } }, decimalsInFloat: 2 },
-                { seriesName: '成交量', opposite: true, title: { text: '成交量', style: { color: '#8b949e' } }, labels: { style: { colors: '#8b949e' } }, min: 0 }
+                {
+                    seriesName: 'K线', // 绑定 K线
+                    title: { text: '价格', style: { color: '#64748b' } },
+                    labels: { style: { colors: '#94a3b8' }, formatter: val => val ? val.toFixed(2) : "" }
+                },
+                {
+                    seriesName: 'K线', // 把 MA20 也绑定到 K线的 Y轴比例尺上！
+                    show: false       // 隐藏该轴（因为它和K线是共用的）
+                },
+                {
+                    seriesName: '成交量', // 绑定 成交量
+                    opposite: true,     // 放在右边
+                    title: { text: '成交量(手)', style: { color: '#64748b' } },
+                    labels: { style: { colors: '#94a3b8' }, formatter: val => val ? (val/10000).toFixed(0) + 'w' : "" }
+                }
             ],
-            grid: { borderColor: '#30363d', strokeDashArray: 3 },
-            legend: { position: 'top', horizontalAlign: 'left' }
+            grid: { borderColor: '#334155', strokeDashArray: 3 },
+            legend: { position: 'top', horizontalAlign: 'left', labels: { colors: '#f8fafc' } }
         };
         
-        // 重置并渲染
-        if(kChart) kChart.destroy();
         kChart = new ApexCharts(document.querySelector("#chart-container"), options);
         kChart.render();
     }
@@ -663,7 +703,7 @@ HTML = '''<!DOCTYPE html>
     async function scan(strategy) {
         document.getElementById('loader').style.display = 'block';
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 45000); // 扫描允许 45秒
+        const timeout = setTimeout(() => controller.abort(), 30000); // 扫描允许等30秒
         try {
             const res = await fetch('/scan', { 
                 method: 'POST', headers: {'Content-Type':'application/json'}, 
@@ -672,15 +712,16 @@ HTML = '''<!DOCTYPE html>
             clearTimeout(timeout);
             const data = await res.json();
             document.getElementById('loader').style.display = 'none';
-            let html = `<h5 class="mb-3 text-white border-bottom border-secondary pb-2">🎯 扫描结果 (点击卡片执行深度侦测)</h5><div class="row g-2">`;
-            if(!data.results || data.results.length === 0) html += "<div class='text-secondary' style='color:#8b949e!important;'>未扫描到标的或网络拥堵</div>";
-            data.results.forEach(r => { html += `<div class="col-md-6"><div class="card p-2 stock-card h-100" onclick="quickAnalyze('${r.code}')"><div class="d-flex justify-content-between mb-1"><strong class="text-white">${r.name}</strong><span class="text-success small">${r.score}分</span></div><div class="text-secondary" style="font-size:12px;color:#8b949e!important;">现价: ${r.close} | 介入位: ${r.advice.介入价}</div></div></div>`; });
+            
+            let html = `<h5 class="mb-3 text-white border-bottom border-secondary pb-2">🎯 扫描结果 (点击卡片执行侦测)</h5><div class="row g-2">`;
+            if(!data.results || data.results.length === 0) html += "<div style='color:#94a3b8;'>未扫描到符合模型要求的标的，或网络拥堵</div>";
+            data.results.forEach(r => { html += `<div class="col-md-6"><div class="card p-2 stock-card h-100" onclick="quickAnalyze('${r.code}')"><div class="d-flex justify-content-between mb-1"><strong class="text-white">${r.name}</strong><span class="text-success small fw-bold">${r.score}分</span></div><div style="font-size:12px;color:#cbd5e1;">现价: ${r.close} | 介入位: <span style="color:#fcd34d;">${r.advice.介入价}</span></div></div></div>`; });
             html += '</div>';
             document.getElementById('displayArea').innerHTML = html;
         } catch(e) {
             clearTimeout(timeout);
             document.getElementById('loader').style.display = 'none';
-            document.getElementById('displayArea').innerHTML = '<div class="alert alert-warning" style="color:#fff;">⏰ 扫描请求超时或由于网络原因中断</div>';
+            document.getElementById('displayArea').innerHTML = `<div class="alert" style="background-color:#991b1b; color:#fff; border:none;">⏰ 扫描请求超时或由于网络原因中断</div>`;
         }
     }
 
@@ -719,6 +760,6 @@ HTML = '''<!DOCTYPE html>
 </html>'''
 
 if __name__ == '__main__':
-    print("✅ PRO-QUANT V12 (完美修复白字/图表/防卡死版) 已启动")
+    print("✅ PRO-QUANT V13 (图表必现修复版) 启动成功！")
     print("👉 访问 http://127.0.0.1:10000")
     app.run(host='0.0.0.0', port=10000)
