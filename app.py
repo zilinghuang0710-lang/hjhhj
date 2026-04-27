@@ -10,7 +10,7 @@ from flask import Flask, request, jsonify, render_template_string
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ================== 常量配置 ==================
+# ================== 常量 ==================
 KDJ_WINDOW = 9
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 RSI_PERIOD = 14
@@ -22,17 +22,15 @@ KLINE_LIMIT = 120
 
 active_cache = {"data": None, "time": 0}
 
-# ================== 防反爬的随机标识池 ==================
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0"
 ]
 
 def create_session():
     session = requests.Session()
-    retry = urllib3.util.retry.Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    retry = urllib3.util.retry.Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
     adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
@@ -42,7 +40,7 @@ def create_session():
 
 http_session = create_session()
 
-# ================== 活跃股票池（双源容错） ==================
+# ================== 活跃股票池（双源） ==================
 def get_active_stocks(limit=400):
     global active_cache
     now = time.time()
@@ -50,7 +48,7 @@ def get_active_stocks(limit=400):
         return active_cache["data"][:limit]
 
     stocks = []
-    # 源1：东方财富
+    # 东方财富
     try:
         url = "http://80.push2.eastmoney.com/api/qt/clist/get"
         params = {
@@ -62,62 +60,31 @@ def get_active_stocks(limit=400):
             "_": str(int(now*1000))
         }
         headers = {"Referer": "http://quote.eastmoney.com/"}
-        resp = http_session.get(url, params=params, headers=headers, timeout=8).json()
+        resp = http_session.get(url, params=params, headers=headers, timeout=5).json()
         if resp and resp.get("data") and resp["data"].get("diff"):
             for item in resp["data"]["diff"]:
                 code, name = item.get("f12"), item.get("f14")
                 if not code or "ST" in name: continue
-                stocks.append({
-                    "code": code,
-                    "name": name,
-                    "volume_ratio": item.get("f20", 1),
-                    "sector": item.get("f100", "")
-                })
-    except Exception as e:
-        print(f"东财活跃股获取失败: {e}")
+                stocks.append({"code": code, "name": name, "volume_ratio": item.get("f20", 1), "sector": item.get("f100", "")})
+    except: pass
 
-    # 源2：腾讯热点
+    # 腾讯热点备用
     if len(stocks) < 50:
         try:
             tx_url = "http://web.ifzq.gtimg.cn/appstock/app/rank/total?type=1&num=200"
             tx_data = http_session.get(tx_url, timeout=5).json()
             if tx_data and tx_data.get("data"):
                 for stock in tx_data["data"].get("stocks", []):
-                    code = stock.get("code")
-                    name = stock.get("name")
+                    code, name = stock.get("code"), stock.get("name")
                     if code and "ST" not in name:
-                        stocks.append({
-                            "code": code,
-                            "name": name,
-                            "volume_ratio": 1.0,
-                            "sector": ""
-                        })
-        except Exception as e:
-            print(f"腾讯热点获取失败: {e}")
+                        stocks.append({"code": code, "name": name, "volume_ratio": 1.0, "sector": ""})
+        except: pass
 
-    # 本地备份
     if not stocks:
         stocks = [
-            {"code":"600519","name":"贵州茅台","sector":"酿酒"},
-            {"code":"000858","name":"五粮液","sector":"酿酒"},
-            {"code":"601318","name":"中国平安","sector":"保险"},
-            {"code":"300750","name":"宁德时代","sector":"电池"},
+            {"code":"002400","name":"省广集团","sector":"传媒"}, {"code":"600519","name":"贵州茅台","sector":"酿酒"},
+            {"code":"300750","name":"宁德时代","sector":"电池"}, {"code":"601318","name":"中国平安","sector":"保险"},
             {"code":"688981","name":"中芯国际","sector":"半导体"},
-            {"code":"002400","name":"省广集团","sector":"传媒"},
-            {"code":"600030","name":"中信证券","sector":"券商"},
-            {"code":"000651","name":"格力电器","sector":"家电"},
-            {"code":"002415","name":"海康威视","sector":"安防"},
-            {"code":"601888","name":"中国中免","sector":"旅游"},
-            {"code":"601166","name":"兴业银行","sector":"银行"},
-            {"code":"000002","name":"万科A","sector":"地产"},
-            {"code":"600036","name":"招商银行","sector":"银行"},
-            {"code":"300059","name":"东方财富","sector":"互联网金融"},
-            {"code":"002594","name":"比亚迪","sector":"汽车"},
-            {"code":"601012","name":"隆基绿能","sector":"光伏"},
-            {"code":"600276","name":"恒瑞医药","sector":"医药"},
-            {"code":"000725","name":"京东方A","sector":"面板"},
-            {"code":"300015","name":"爱尔眼科","sector":"医疗"},
-            {"code":"603259","name":"药明康德","sector":"CRO"},
         ]
     stocks = list({s['code']: s for s in stocks}.values())
     active_cache["data"] = stocks
@@ -128,18 +95,12 @@ def get_active_stocks(limit=400):
 def resolve_stock_input(keyword):
     keyword = str(keyword).strip()
     if re.match(r'^\d{6}$', keyword): return keyword, f"A股_{keyword}"
-
-    # 本地词库
     local = {
-        "省广集团":"002400", "SGJT":"002400",
-        "贵州茅台":"600519", "GZMT":"600519",
-        "宁德时代":"300750", "NDSD":"300750",
-        "中信证券":"600030", "ZXZQ":"600030",
-        "东方财富":"300059", "DFCF":"300059",
+        "省广集团":"002400", "sgjt":"002400", "贵州茅台":"600519", "gzmt":"600519",
+        "宁德时代":"300750", "ndsd":"300750", "中信证券":"600030", "zxzq":"600030",
+        "东方财富":"300059", "dfcf":"300059",
     }
     if keyword in local: return local[keyword], keyword
-
-    # 源1：东方财富搜索
     try:
         resp = http_session.get("https://searchapi.eastmoney.com/api/suggest/get", params={
             "input":keyword,"type":"14","token":"D43BF722C8E33BDC906FB84D85E326E8","count":"1"}, timeout=3)
@@ -149,8 +110,6 @@ def resolve_stock_input(keyword):
                 item = data["QuotationCodeTable"]["Data"][0]
                 return item["Code"], item["Name"]
     except: pass
-
-    # 源2：腾讯搜索
     try:
         resp = http_session.get("http://smartbox.gtimg.cn/s3/", params={"v":2,"q":keyword,"t":"all"}, timeout=3)
         resp.encoding = 'GBK'
@@ -161,10 +120,9 @@ def resolve_stock_input(keyword):
                 code_match = re.search(r'\d{6}', parts[0])
                 if code_match: return code_match.group(0), parts[1]
     except: pass
-
     return None, None
 
-# ================== 三源K线引擎（东财+腾讯+新浪） ==================
+# ================== 极速三源K线引擎（腾讯优先） ==================
 class StockAnalyzer:
     def __init__(self, symbol, name, cost_price=None):
         self.symbol, self.name = symbol, name
@@ -173,92 +131,68 @@ class StockAnalyzer:
         self.chip_peak = 0.0
 
     def fetch_data(self, end_date=None):
-        # 源1：东方财富
+        # 腾讯（最快）
+        prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
+        tx_url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{self.symbol},day,,,{KLINE_LIMIT},qfq"
+        try:
+            resp = http_session.get(tx_url, timeout=2)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and data.get("code") == 0:
+                    stock_data = data["data"].get(f"{prefix}{self.symbol}")
+                    if stock_data:
+                        kline = stock_data.get("qfqday") or stock_data.get("day")
+                        if kline and len(kline) >= 10:
+                            self.df = pd.DataFrame([{
+                                "date": i[0], "open": float(i[1]), "close": float(i[2]),
+                                "high": float(i[3]), "low": float(i[4]), "volume": float(i[5]),
+                                "turnover": 0.0
+                            } for i in kline])
+                            return True
+        except: pass
+
+        # 东财
         mkt = "0" if self.symbol.startswith(("0","3")) else "1"
-        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {"secid": f"{mkt}.{self.symbol}",
-                  "fields1": "f1,f2,f3,f4,f5,f6",
-                  "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                  "klt": "101",
-                  "fqt": "1",
-                  "end": end_date if end_date else "20500101",
-                  "lmt": str(KLINE_LIMIT)}
+        url_em = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params_em = {
+            "secid": f"{mkt}.{self.symbol}",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101", "fqt": "1",
+            "end": end_date if end_date else "20500101",
+            "lmt": str(KLINE_LIMIT)
+        }
         headers = {"Referer": "http://quote.eastmoney.com/"}
         try:
-            resp = http_session.get(url, params=params, headers=headers, timeout=5)
+            resp = http_session.get(url_em, params=params_em, headers=headers, timeout=2)
             if resp.status_code == 200:
                 data = resp.json()
                 if data and data.get("data") and data["data"].get("klines"):
                     klines = data["data"]["klines"]
                     if len(klines) >= 10:
-                        parsed = []
-                        for item in klines:
-                            p = item.split(",")
-                            parsed.append({
-                                "date": p[0],
-                                "open": float(p[1]),
-                                "close": float(p[2]),
-                                "high": float(p[3]),
-                                "low": float(p[4]),
-                                "volume": float(p[5]),
-                                "turnover": float(p[10])
-                            })
-                        self.df = pd.DataFrame(parsed)
-                        print(f"✅ 东财数据 OK ({len(self.df)}条)")
+                        self.df = pd.DataFrame([{
+                            "date": p[0], "open": float(p[1]), "close": float(p[2]),
+                            "high": float(p[3]), "low": float(p[4]), "volume": float(p[5]),
+                            "turnover": float(p[10])
+                        } for p in (item.split(",") for item in klines)])
                         return True
-        except Exception as e:
-            print(f"东财K线 {self.symbol} 失败: {e}")
+        except: pass
 
-        # 源2：腾讯
-        prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
-        tx_url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{self.symbol},day,,,{KLINE_LIMIT},qfq"
+        # 新浪（超快失败）
         try:
-            resp = http_session.get(tx_url, timeout=5)
-            data = resp.json()
-            if data and data.get("code") == 0:
-                stock_data = data["data"].get(f"{prefix}{self.symbol}")
-                kline = stock_data.get("qfqday") or stock_data.get("day")
-                if kline and len(kline) >= 10:
-                    parsed = [{
-                        "date": i[0],
-                        "open": float(i[1]),
-                        "close": float(i[2]),
-                        "high": float(i[3]),
-                        "low": float(i[4]),
-                        "volume": float(i[5]),
-                        "turnover": 0.0
-                    } for i in kline]
-                    self.df = pd.DataFrame(parsed)
-                    print(f"✅ 腾讯数据 OK ({len(self.df)}条)")
-                    return True
-        except Exception as e:
-            print(f"腾讯K线 {self.symbol} 失败: {e}")
-
-        # 源3：新浪财经（终极兜底，无换手率）
-        sina_prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
-        # 新浪日线接口
-        sina_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sina_prefix}{self.symbol}&scale=240&ma=no&datalen={KLINE_LIMIT}"
-        try:
-            resp = http_session.get(sina_url, timeout=5)
-            if resp.status_code == 200:
+            sina_prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
+            sina_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sina_prefix}{self.symbol}&scale=240&ma=no&datalen={KLINE_LIMIT}"
+            resp = http_session.get(sina_url, timeout=1)
+            if resp.status_code == 200 and resp.text:
                 raw = resp.json()
                 if isinstance(raw, list) and len(raw) >= 10:
-                    parsed = []
-                    for item in raw:
-                        parsed.append({
-                            "date": item["day"],
-                            "open": float(item["open"]),
-                            "close": float(item["close"]),
-                            "high": float(item["high"]),
-                            "low": float(item["low"]),
-                            "volume": float(item["volume"]),
-                            "turnover": 0.0   # 新浪不提供换手
-                        })
-                    self.df = pd.DataFrame(parsed)
-                    print(f"✅ 新浪数据 OK ({len(self.df)}条)")
+                    self.df = pd.DataFrame([{
+                        "date": item["day"], "open": float(item["open"]), "close": float(item["close"]),
+                        "high": float(item["high"]), "low": float(item["low"]),
+                        "volume": float(item["volume"]), "turnover": 0.0
+                    } for item in raw])
                     return True
-        except Exception as e:
-            print(f"新浪K线 {self.symbol} 失败: {e}")
+        except: pass
 
         return False
 
@@ -281,12 +215,9 @@ class StockAnalyzer:
         df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['MACD'] = 2*(df['DIF'] - df['DEA'])
         delta = df['close'].diff()
-        gain = delta.where(delta>0, 0)
-        loss = -delta.where(delta<0, 0)
-        avg_gain = gain.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-        rs = avg_gain / avg_loss
-        df['RSI'] = 100 - (100/(1+rs))
+        gain = delta.where(delta>0, 0).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+        loss = (-delta.where(delta<0, 0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+        df['RSI'] = 100 - (100/(1+gain/loss))
         df['BOLL_MID'] = df['close'].rolling(BOLL_PERIOD).mean()
         std = df['close'].rolling(BOLL_PERIOD).std()
         df['BOLL_UP'] = df['BOLL_MID'] + BOLL_WIDTH*std
@@ -341,12 +272,9 @@ class StockAnalyzer:
         for _, row in self.df.tail(80).iterrows():
             chart_data.append({
                 "date": row['date'],
-                "open": round(row['open'], 2),
-                "high": round(row['high'], 2),
-                "low": round(row['low'], 2),
-                "close": round(row['close'], 2),
-                "ma5": round(row['MA5'], 2),
-                "ma20": round(row['MA20'], 2),
+                "open": round(row['open'], 2), "high": round(row['high'], 2),
+                "low": round(row['low'], 2), "close": round(row['close'], 2),
+                "ma5": round(row['MA5'], 2), "ma20": round(row['MA20'], 2),
                 "volume": round(row['volume'], 0)
             })
         return {
@@ -402,7 +330,7 @@ def scan_stocks(strategy, top_n=10):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(analyze_single_scan, s["code"], strategy, s["name"], s["sector"]): s for s in stocks}
         for f in as_completed(futures):
-            time.sleep(0.08)  # 反爬间隔
+            time.sleep(0.08)
             res = f.result()
             if res: results.append(res)
     results.sort(key=lambda x: x['score'], reverse=True)
@@ -434,7 +362,7 @@ def run_backtest(strategy, test_date_str, hold_days=1):
     acc = sum(1 for r in results if r['success'])/len(results)*100
     return {"date":test_date_str, "strategy":strategy, "hold":hold_days, "total":len(results), "accuracy":acc, "picks":results}
 
-# ================== Flask 路由 ==================
+# ================== Flask 应用 ==================
 app = Flask(__name__)
 
 @app.route('/')
@@ -446,8 +374,7 @@ def analyze():
     code, name = resolve_stock_input(d.get('stock'))
     if not code: return jsonify({"error":"无法识别股票"})
     az = StockAnalyzer(code, name, d.get('cost'))
-    if not az.fetch_data():
-        return jsonify({"error":"行情获取失败（已尝试东财/腾讯/新浪三源）"})
+    if not az.fetch_data(): return jsonify({"error":"行情获取失败（已尝试腾讯/东财/新浪）"})
     rep = az.get_full_report()
     if "error" in rep: return jsonify(rep)
     return jsonify({"report":rep})
@@ -492,7 +419,7 @@ HTML = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PRO-QUANT V8.0 三源容灾版</title>
+    <title>PRO-QUANT V8.5 极速全能版</title>
     <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.bootcdn.net/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
@@ -512,7 +439,7 @@ HTML = '''<!DOCTYPE html>
 </head>
 <body>
 <nav class="navbar navbar-dark bg-dark mb-3 border-bottom border-secondary">
-    <div class="container-fluid"><span class="navbar-brand fw-bold text-success">🛰️ PRO-QUANT V8.0 三源容灾引擎</span></div>
+    <div class="container-fluid"><span class="navbar-brand fw-bold text-success">🛰️ PRO-QUANT V8.5 三源极速引擎</span></div>
 </nav>
 
 <div class="container-fluid px-4">
@@ -673,6 +600,6 @@ HTML = '''<!DOCTYPE html>
 </html>'''
 
 if __name__ == '__main__':
-    print("✅ 三源K线引擎已就绪（东财+腾讯+新浪）")
-    print("👉 访问: http://127.0.0.1:10000")
+    print("⚡ PRO-QUANT V8.5 极速全能版已启动")
+    print("👉 浏览器访问: http://127.0.0.1:10000")
     app.run(host='0.0.0.0', port=10000)
