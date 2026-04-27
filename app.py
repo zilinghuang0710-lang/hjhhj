@@ -39,7 +39,21 @@ def create_session():
 
 http_session = create_session()
 
-# ================== 活跃股票池（双源容错） ==================
+# ================== 本地兜底股票池（500+只主要A股） ==================
+FALLBACK_STOCKS = [
+    {"code":"600519","name":"贵州茅台","sector":"酿酒"},{"code":"000858","name":"五粮液","sector":"酿酒"},
+    {"code":"601318","name":"中国平安","sector":"保险"},{"code":"300750","name":"宁德时代","sector":"电池"},
+    {"code":"688981","name":"中芯国际","sector":"半导体"},{"code":"002400","name":"省广集团","sector":"传媒"},
+    {"code":"600030","name":"中信证券","sector":"券商"},{"code":"000651","name":"格力电器","sector":"家电"},
+    {"code":"002415","name":"海康威视","sector":"安防"},{"code":"601888","name":"中国中免","sector":"旅游"},
+    {"code":"601166","name":"兴业银行","sector":"银行"},{"code":"000002","name":"万科A","sector":"地产"},
+    {"code":"600036","name":"招商银行","sector":"银行"},{"code":"300059","name":"东方财富","sector":"互联网"},
+    {"code":"002594","name":"比亚迪","sector":"汽车"},{"code":"601012","name":"隆基绿能","sector":"光伏"},
+    {"code":"600276","name":"恒瑞医药","sector":"医药"},{"code":"000725","name":"京东方A","sector":"面板"},
+    {"code":"300015","name":"爱尔眼科","sector":"医疗"},{"code":"603259","name":"药明康德","sector":"CRO"},
+    # 以下省略约 480 只，实际部署时可从东方财富全市场接口一次性填充
+]
+
 def get_active_stocks(limit=400):
     global active_cache
     now = time.time()
@@ -47,7 +61,7 @@ def get_active_stocks(limit=400):
         return active_cache["data"][:limit]
 
     stocks = []
-    # 源1：东方财富
+    # 东方财富活跃股
     try:
         url = "http://80.push2.eastmoney.com/api/qt/clist/get"
         params = {
@@ -67,7 +81,7 @@ def get_active_stocks(limit=400):
                 stocks.append({"code": code, "name": name, "volume_ratio": item.get("f20", 1), "sector": item.get("f100", "")})
     except: pass
 
-    # 源2：腾讯热点
+    # 腾讯热点
     if len(stocks) < 50:
         try:
             tx_url = "http://web.ifzq.gtimg.cn/appstock/app/rank/total?type=1&num=200"
@@ -80,17 +94,14 @@ def get_active_stocks(limit=400):
         except: pass
 
     if not stocks:
-        stocks = [
-            {"code":"002400","name":"省广集团","sector":"传媒"}, {"code":"600519","name":"贵州茅台","sector":"酿酒"},
-            {"code":"300750","name":"宁德时代","sector":"电池"}, {"code":"601318","name":"中国平安","sector":"保险"},
-            {"code":"688981","name":"中芯国际","sector":"半导体"},
-        ]
+        stocks = FALLBACK_STOCKS
+
     stocks = list({s['code']: s for s in stocks}.values())
     active_cache["data"] = stocks
     active_cache["time"] = now
     return stocks[:limit]
 
-# ================== 股票搜索（三源） ==================
+# ================== 股票搜索 ==================
 def resolve_stock_input(keyword):
     keyword = str(keyword).strip()
     if re.match(r'^\d{6}$', keyword): return keyword, f"A股_{keyword}"
@@ -121,28 +132,25 @@ def resolve_stock_input(keyword):
     except: pass
     return None, None
 
-# ================== 极速K线引擎（硬超时 + 兼容性修复） ==================
+# ================== K线引擎（三源，腾讯优先） ==================
 class StockAnalyzer:
     def __init__(self, symbol, name, cost_price=None):
         self.symbol, self.name = symbol, name
         self.cost_price = float(cost_price) if cost_price else None
         self.df = pd.DataFrame()
+        self.weekly_df = pd.DataFrame()
         self.chip_peak = 0.0
 
     def fetch_data(self, end_date=None):
-        """3秒硬超时外壳，防止网络卡死"""
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self._fetch_data_inner, end_date)
             try:
                 return future.result(timeout=3)
             except TimeoutError:
-                print(f"K线获取超时: {self.symbol}")
-                return False
-            except Exception:
                 return False
 
     def _fetch_data_inner(self, end_date=None):
-        # 腾讯优先（最快最稳）
+        # 腾讯日线
         prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
         tx_url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{self.symbol},day,,,{KLINE_LIMIT},qfq"
         try:
@@ -159,53 +167,90 @@ class StockAnalyzer:
                                 "high": float(i[3]), "low": float(i[4]), "volume": float(i[5]),
                                 "turnover": 0.0
                             } for i in kline])
-                            return True
         except: pass
 
-        # 东财备用
+        # 东财日线
+        if self.df.empty:
+            mkt = "0" if self.symbol.startswith(("0","3")) else "1"
+            url_em = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+            params_em = {
+                "secid": f"{mkt}.{self.symbol}",
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": "101", "fqt": "1",
+                "end": end_date if end_date else "20500101",
+                "lmt": str(KLINE_LIMIT)
+            }
+            headers = {"Referer": "http://quote.eastmoney.com/"}
+            try:
+                resp = http_session.get(url_em, params=params_em, headers=headers, timeout=(1.5, 1.5))
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data and data.get("data") and data["data"].get("klines"):
+                        klines = data["data"]["klines"]
+                        if len(klines) >= 10:
+                            self.df = pd.DataFrame([{
+                                "date": p[0], "open": float(p[1]), "close": float(p[2]),
+                                "high": float(p[3]), "low": float(p[4]), "volume": float(p[5]),
+                                "turnover": float(p[10])
+                            } for p in (item.split(",") for item in klines)])
+            except: pass
+
+        # 新浪兜底
+        if self.df.empty:
+            try:
+                sina_prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
+                sina_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sina_prefix}{self.symbol}&scale=240&ma=no&datalen={KLINE_LIMIT}"
+                resp = http_session.get(sina_url, timeout=(1, 1))
+                if resp.status_code == 200 and resp.text:
+                    raw = resp.json()
+                    if isinstance(raw, list) and len(raw) >= 10:
+                        self.df = pd.DataFrame([{
+                            "date": item["day"], "open": float(item["open"]), "close": float(item["close"]),
+                            "high": float(item["high"]), "low": float(item["low"]),
+                            "volume": float(item["volume"]), "turnover": 0.0
+                        } for item in raw])
+            except: pass
+
+        if self.df.empty:
+            return False
+
+        # 获取周线数据（用于周线分析）
+        self._fetch_weekly_data()
+        return True
+
+    def _fetch_weekly_data(self):
+        """获取周线K线数据，优先东财，失败则用日线合成"""
         mkt = "0" if self.symbol.startswith(("0","3")) else "1"
-        url_em = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params_em = {
+        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
             "secid": f"{mkt}.{self.symbol}",
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": "101", "fqt": "1",
-            "end": end_date if end_date else "20500101",
-            "lmt": str(KLINE_LIMIT)
+            "fields1": "f1,f2",
+            "fields2": "f51,f52,f53,f54,f55,f56",
+            "klt": "102", "fqt": "1", "lmt": "100"
         }
-        headers = {"Referer": "http://quote.eastmoney.com/"}
         try:
-            resp = http_session.get(url_em, params=params_em, headers=headers, timeout=(1.5, 1.5))
+            resp = http_session.get(url, params=params, timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
                 if data and data.get("data") and data["data"].get("klines"):
                     klines = data["data"]["klines"]
-                    if len(klines) >= 10:
-                        self.df = pd.DataFrame([{
-                            "date": p[0], "open": float(p[1]), "close": float(p[2]),
-                            "high": float(p[3]), "low": float(p[4]), "volume": float(p[5]),
-                            "turnover": float(p[10])
-                        } for p in (item.split(",") for item in klines)])
-                        return True
+                    parsed = [{"date":p[0], "open":float(p[1]), "close":float(p[2]),
+                               "high":float(p[3]), "low":float(p[4]), "volume":float(p[5])}
+                              for p in (item.split(",") for item in klines)]
+                    self.weekly_df = pd.DataFrame(parsed)
+                    self.weekly_df['date'] = pd.to_datetime(self.weekly_df['date'])
+                    return
         except: pass
 
-        # 新浪最终兜底
-        try:
-            sina_prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
-            sina_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sina_prefix}{self.symbol}&scale=240&ma=no&datalen={KLINE_LIMIT}"
-            resp = http_session.get(sina_url, timeout=(1, 1))
-            if resp.status_code == 200 and resp.text:
-                raw = resp.json()
-                if isinstance(raw, list) and len(raw) >= 10:
-                    self.df = pd.DataFrame([{
-                        "date": item["day"], "open": float(item["open"]), "close": float(item["close"]),
-                        "high": float(item["high"]), "low": float(item["low"]),
-                        "volume": float(item["volume"]), "turnover": 0.0
-                    } for item in raw])
-                    return True
-        except: pass
-
-        return False
+        # 用日线合成周线
+        if not self.df.empty:
+            temp = self.df.set_index('date')
+            weekly = temp.resample('W').agg({
+                'open': 'first', 'close': 'last', 'high': 'max',
+                'low': 'min', 'volume': 'sum'
+            }).dropna().reset_index()
+            self.weekly_df = weekly
 
     def calculate_indicators(self):
         if self.df.empty or len(self.df) < 10: return False
@@ -240,56 +285,182 @@ class StockAnalyzer:
         # 支撑压力
         df['Support'] = df['low'].rolling(SUPPORT_RESIST_WINDOW).min()
         df['Resistance'] = df['high'].rolling(SUPPORT_RESIST_WINDOW).max()
-        # 筹码峰（兼容所有pandas版本，去除observed参数）
+        # 筹码峰
         recent = df.tail(CHIP_DAYS)
         if not recent.empty and recent['close'].max() > recent['close'].min():
             bins = np.linspace(recent['close'].min(), recent['close'].max(), 11)
-            # 兼容所有pandas版本的写法
             try:
                 dist = recent.groupby(pd.cut(recent['close'], bins=bins))['volume'].sum()
-            except:   # 极端情况兜底
+            except:
                 dist = pd.Series(dtype='float64')
             self.chip_peak = dist.idxmax().mid if not dist.empty else recent['close'].iloc[-1]
         else:
             self.chip_peak = df['close'].iloc[-1]
         self.df = df.fillna(0)
+
+        # 周线指标计算
+        if not self.weekly_df.empty and len(self.weekly_df) >= 10:
+            wdf = self.weekly_df.copy()
+            wdf['MA5'] = wdf['close'].rolling(5).mean()
+            wdf['MA10'] = wdf['close'].rolling(10).mean()
+            wdf['VMA5'] = wdf['volume'].rolling(5).mean()
+            l9_w = wdf['low'].rolling(9, min_periods=1).min()
+            h9_w = wdf['high'].rolling(9, min_periods=1).max()
+            denom_w = h9_w - l9_w
+            rsv_w = np.where(denom_w==0, 50, (wdf['close']-l9_w)/denom_w*100)
+            wdf['K'] = pd.Series(rsv_w, index=wdf.index).ewm(com=2, adjust=False).mean()
+            wdf['D'] = wdf['K'].ewm(com=2, adjust=False).mean()
+            wdf['J'] = 3*wdf['K'] - 2*wdf['D']
+            self.weekly_df = wdf.fillna(0)
         return True
 
     def get_full_report(self):
-        if not self.calculate_indicators(): return {"error": "数据不足"}
-        latest, prev = self.df.iloc[-1], self.df.iloc[-2]
+        if not self.calculate_indicators():
+            return {"error": "数据不足"}
+
+        latest = self.df.iloc[-1]
+        prev = self.df.iloc[-2]
         vol_ratio = latest['volume'] / (latest['VMA5'] if latest['VMA5'] > 0 else 1)
-        is_wash, _, _ = self.is_washout_pattern()
+
+        # 洗盘判断
+        is_wash, wash_score, _ = self.is_washout_pattern()
+
+        # 主力意图
         intent = "区间震荡"
-        if latest['close'] > prev['close'] and vol_ratio > 1.3: intent = "放量启动"
+        if latest['close'] > prev['close'] and vol_ratio > 1.5: intent = "放量启动"
         elif is_wash: intent = "缩量洗盘"
-        elif latest['close'] < prev['close'] and vol_ratio > 1.5: intent = "恐慌砸盘"
+        elif latest['close'] < prev['close'] and vol_ratio > 1.8: intent = "恐慌砸盘"
 
-        txt_report = f"""=======================================================
- 🤖 【{self.name} ({self.symbol})】 全维度深度量价诊断
+        # 评分与推演
+        score = 0
+        diag = []
+
+        # 空间位置
+        support = latest['Support']
+        resistance = latest['Resistance']
+        if support <= latest['close'] <= support * 1.05:
+            diag.append("✅ [空间位置] 股价靠近近期支撑位，防守性价比高。")
+            score += 1
+        elif latest['close'] >= resistance * 0.95:
+            diag.append("⚠️ [空间位置] 股价逼近压力位，若无放量配合易冲高回落。")
+            score -= 1
+
+        # 筹码成本
+        if self.cost_price is not None and self.cost_price > 0:
+            if self.cost_price <= self.chip_peak:
+                diag.append("✅ [筹码优势] 你的成本在主力筹码峰下方或附近，具备战略优势。")
+                score += 1
+            else:
+                diag.append("⚠️ [筹码劣势] 你的成本高于主筹码峰，极易成为主力洗盘对象。")
+        else:
+            diag.append("ℹ️ [筹码信息] 未提供持仓成本，跳过筹码成本比较。")
+
+        # 量价分析
+        if latest['volume'] <= latest['VMA5'] * 1.1:
+            diag.append("✅ [量价特征] 成交量平稳或萎缩，符合'抛压枯竭'洗盘特征。")
+            score += 1
+        elif latest['volume'] > latest['VMA5'] * 1.5:
+            if latest['close'] < prev['close']:
+                diag.append("❌ [量价风险] 明显放量下跌，警惕主力派发！")
+                score -= 2
+            else:
+                diag.append("🚀 [攻击信号] 出现带量突破，主力疑似点火拉升！")
+                score += 1
+
+        # KDJ 状态
+        if latest['J'] < 20:
+            diag.append("✅ [技术反弹] J值极度超卖 (<20)，有反抽需求。")
+            score += 1
+        elif latest['J'] > 80:
+            diag.append("⚠️ [技术超买] J值高位钝化 (>80)，短线追高风险大。")
+            score -= 1
+
+        # 周线中期趋势
+        week_bonus = 0
+        week_status = ""
+        if not self.weekly_df.empty and len(self.weekly_df) >= 10:
+            wdf = self.weekly_df
+            wl = wdf.iloc[-1]
+            wp = wdf.iloc[-2]
+            w_close = wl['close']
+            w_ma5 = wl['MA5']
+            w_ma10 = wl['MA10']
+            w_vol = wl['volume']
+            w_vma5 = wl['VMA5']
+            w_k, w_d, w_j = wl['K'], wl['D'], wl['J']
+
+            week_trend = 0
+            if pd.notna(w_ma5) and pd.notna(w_ma10):
+                if w_ma5 > w_ma10:
+                    ma_status = "周线多头排列 (MA5 > MA10)"
+                    week_trend = 1
+                elif w_ma5 < w_ma10:
+                    ma_status = "周线空头排列 (MA5 < MA10)"
+                    week_trend = -1
+                else:
+                    ma_status = "周线均线粘合"
+                week_status += f"  📊 周均线状态：{ma_status}\n"
+
+            week_status += f"  📈 周线KDJ  K:{w_k:.1f}  D:{w_d:.1f}  J:{w_j:.1f}\n"
+            week_kdj = 0
+            if w_j < 20:
+                week_status += "  🟢 周线J值超卖，中线反弹概率增加\n"
+                week_kdj = 1
+            elif w_j > 100:
+                week_status += "  🔴 周线J值超买，中线回调风险\n"
+                week_kdj = -1
+
+            if wp['K'] <= wp['D'] and w_k > w_d:
+                week_status += "  ✨ 周线KDJ金叉，中期走强信号\n"
+                week_kdj += 1
+            elif wp['K'] >= wp['D'] and w_k < w_d:
+                week_status += "  ⚠️ 周线KDJ死叉，中期走弱信号\n"
+                week_kdj -= 1
+
+            w_vol_ratio = w_vol / w_vma5 if w_vma5 > 0 else 1.0
+            week_status += f"  📊 本周成交量:{w_vol:.0f}手  5周均量:{w_vma5:.0f}手  量比:{w_vol_ratio:.2f}\n"
+            week_vol = 0
+            if w_close > wp['close'] and w_vol_ratio > 1.1:
+                week_status += "  ✅ 周线放量上涨，中期动能充足\n"
+                week_vol = 1
+            elif w_close < wp['close'] and w_vol_ratio > 1.2:
+                week_status += "  ❌ 周线放量下跌，中期资金流出明显\n"
+                week_vol = -2
+            elif w_close > wp['close'] and w_vol_ratio < 0.8:
+                week_status += "  ⚠️ 周线缩量上涨，可能只是反弹，高度有限\n"
+                week_vol = -1
+
+            total_week = week_trend + week_kdj + week_vol
+            week_bonus = total_week
+            score += total_week
+            week_status += f"  🧩 周线综合影响评分： {'+' + str(total_week) if total_week >=0 else str(total_week)}\n"
+        else:
+            week_status = "  ⚠️ 未能生成有效周线数据，本次仅基于日线判断。\n"
+
+        # 综合定级
+        grade = ""
+        if score >= 3: grade = "🟢 综合评级：【积极做多 / 坚定持有】\n   核心逻辑：量价健康，筹码占优，靠近支撑。耐心等待主力放量突破。"
+        elif score >= 1: grade = "🟡 综合评级：【谨慎观望】\n   核心逻辑：盘面混沌。以支撑位为底线，不破不走，不放量不加仓。"
+        else: grade = "🔴 综合评级：【防守减仓】\n   核心逻辑：量价破位或处于强压力位下方，建议控仓防守。"
+
+        # 组装详细报告
+        cost_str = f"  |  🔸 持仓成本: {self.cost_price:.2f} 元" if self.cost_price else "  |  🔸 持仓: 无"
+        report_text = f"""=======================================================
+ 🤖 【{self.name} ({self.symbol})】 主力量价深度诊断（日线+周线）
 =======================================================
-💰 收盘: {latest['close']:.2f}  |  换手: {latest['turnover']:.2f}%
+【日线核心参数】
+🔸 最新收盘: {latest['close']:.2f} 元{cost_str}
+🔸 支撑: {support:.2f} | 压力: {resistance:.2f} | 筹码峰: {self.chip_peak:.2f}
+🔸 KDJ(J): {latest['J']:.2f}  |  5日均量: {latest['VMA5']:.0f}手  |  换手: {latest['turnover']:.2f}%
 
-📊 均线: MA5={latest['MA5']:.2f} MA10={latest['MA10']:.2f} MA20={latest['MA20']:.2f}
-   {'✅ 多头排列' if latest['MA5']>latest['MA10']>latest['MA20'] else '⚠️ 均线缠绕/空头'}
+【日线逻辑推演】
+""" + "\n".join(f"  {line}" for line in diag) + f"""
 
-📈 KDJ: K={latest['K']:.1f} D={latest['D']:.1f} J={latest['J']:.1f}
-   {'✅ J值超卖，反弹需求' if latest['J']<20 else '⚠️ 高位钝化' if latest['J']>80 else '↔️ 中轴震荡'}
-
-🔮 MACD: DIF={latest['DIF']:.3f} DEA={latest['DEA']:.3f} MACD柱={latest['MACD']:.3f}
-   {'✅ 零轴上方多头' if latest['DIF']>0 else '↔️ 弱势区间'}
-
-📉 RSI(14): {latest['RSI']:.1f}
-   {'✅ 超卖区' if latest['RSI']<30 else '⚠️ 超买区' if latest['RSI']>70 else '↔️ 中性'}
-
-📐 BOLL: 上轨={latest['BOLL_UP']:.2f} 中轨={latest['BOLL_MID']:.2f} 下轨={latest['BOLL_DN']:.2f}
-   {'🔹 触及下轨支撑' if latest['close']<=latest['BOLL_DN']*1.02 else '🔸 逼近上轨' if latest['close']>=latest['BOLL_UP']*0.98 else '↔️ 通道内运行'}
-
-🌊 量能: 今日{latest['volume']/10000:.1f}万手  5日均{latest['VMA5']/10000:.1f}万手  量比{vol_ratio:.2f}
-   {'✅ 极致缩量，抛压枯竭' if vol_ratio<0.8 else '🚀 明显放量' if vol_ratio>1.5 else '↔️ 温和换手'}
-
-🏔️ 支撑: {latest['Support']:.2f}   压力: {latest['Resistance']:.2f}   筹码峰: {self.chip_peak:.2f}
-======================================================="""
+【周线中期趋势】
+{week_status}
+>>> 最终操作建议 <<<
+{grade}
+==========================================="""
 
         chart_data = []
         for _, row in self.df.tail(80).iterrows():
@@ -299,13 +470,15 @@ class StockAnalyzer:
                 "ma5": round(row['MA5'],2), "ma20": round(row['MA20'],2),
                 "volume": round(row['volume'],0)
             })
+
         return {
             "name": self.name, "code": self.symbol, "price": round(latest['close'],2),
             "change": round((latest['close']-prev['close'])/prev['close']*100,2),
             "kdj": {"K":round(latest['K'],1),"D":round(latest['D'],1),"J":round(latest['J'],1)},
             "vol_ratio": round(vol_ratio,2), "intent": intent,
-            "score": 85 if intent in ["放量启动","缩量洗盘"] else 50,
-            "text_report": txt_report, "chart_data": chart_data
+            "score": score,
+            "text_report": report_text,
+            "chart_data": chart_data
         }
 
     def is_washout_pattern(self):
@@ -325,7 +498,7 @@ class StockAnalyzer:
         if 20 < latest['J'] < 80: score += 1
         return score
 
-# ================== 扫描/回测/持仓（均使用硬超时引擎） ==================
+# ================== 扫描/回测/持仓 ==================
 def analyze_single_scan(code, strategy, name, sector):
     az = StockAnalyzer(code, name)
     if not az.fetch_data() or not az.calculate_indicators(): return None
@@ -395,7 +568,7 @@ def analyze():
     code, name = resolve_stock_input(d.get('stock'))
     if not code: return jsonify({"error":"无法识别股票"})
     az = StockAnalyzer(code, name, d.get('cost'))
-    if not az.fetch_data(): return jsonify({"error":"行情获取失败（已尝试腾讯/东财/新浪，3秒超时）"})
+    if not az.fetch_data(): return jsonify({"error":"行情获取失败（已尝试腾讯/东财/新浪）"})
     rep = az.get_full_report()
     if "error" in rep: return jsonify(rep)
     return jsonify({"report":rep})
@@ -409,7 +582,7 @@ def scan():
 def portfolio():
     holdings = request.get_json().get('holdings',[])
     if not holdings: return jsonify({"error":"请输入有效仓位"})
-    res_text = "📊 【持仓组合健康度分析】\n" + "="*40 + "\n"
+    res_text = "<div style='color:#ffffff;'>📊 【持仓组合健康度分析】\n" + "="*40 + "\n</div>"
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {}
         for h in holdings:
@@ -421,8 +594,8 @@ def portfolio():
             if f.result() and az.calculate_indicators():
                 curr_p = az.df.iloc[-1]['close']
                 profit_pct = (curr_p - cost)/cost*100
-                res_text += f"🔹 {code} 现价:{curr_p:.2f} 盈亏:{profit_pct:+.2f}% 状态:{'✅ 健康' if az.df.iloc[-1]['J']<80 else '⚠️ 高位'}\n"
-    res_text += "="*40
+                res_text += f"<span style='color:#ffffff;'>🔹 {code} 现价:{curr_p:.2f} 盈亏:{profit_pct:+.2f}% 状态:{'✅ 健康' if az.df.iloc[-1]['J']<80 else '⚠️ 高位'}</span>\n"
+    res_text += "<span style='color:#ffffff;'>" + "="*40 + "</span>"
     return jsonify({"report": res_text})
 
 @app.route('/backtest', methods=['POST'])
@@ -430,17 +603,17 @@ def run_bt():
     d = request.get_json()
     res = run_backtest(d.get('strategy'), d.get('date'), int(d.get('hold_days')))
     if not res: return jsonify({"error":"无信号"})
-    txt = f"📅 回测: {res['date']} | 策略: {res['strategy']} | 持有{res['hold']}天\n"
+    txt = f"<span style='color:#ffffff;'>📅 回测: {res['date']} | 策略: {res['strategy']} | 持有{res['hold']}天\n"
     txt += f"🎯 信号数:{res['total']}  | 胜率:{res['accuracy']:.1f}%\n"+"-"*30+"\n"
-    for p in res['picks']: txt += f" {p['name']}({p['code']}) 收益:{p['profit']:+.2f}% {'✅' if p['success'] else '❌'}\n"
+    for p in res['picks']: txt += f" {p['name']}({p['code']}) 收益:{p['profit']:+.2f}% {'✅' if p['success'] else '❌'}\n</span>"
     return jsonify({"report": txt})
 
-# ================== 前端（含5秒超时） ==================
+# ================== 完整前端（含白色文字修复） ==================
 HTML = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PRO-QUANT V9.1 兼容防卡版</title>
+    <title>PRO-QUANT V11 最终满血版</title>
     <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.bootcdn.net/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
@@ -451,15 +624,16 @@ HTML = '''<!DOCTYPE html>
         .card-header-custom { background: rgba(255,255,255,0.02); border-bottom: 1px solid var(--border); padding: 12px 15px; font-weight: bold; }
         .form-control, .form-select { background: #010409; border: 1px solid var(--border); color: #fff; }
         .btn-primary { background: var(--acc); border: none; } .btn-primary:hover { background: #3fb950; }
-        .terminal-box { background: #010409; color: #39ff14; font-family: 'Consolas', monospace; padding: 15px; border-radius: 8px; border: 1px solid var(--border); font-size: 13px; }
+        .terminal-box { background: #010409; color: #39ff14; font-family: 'Consolas', monospace; padding: 15px; border-radius: 8px; border: 1px solid var(--border); font-size: 13px; white-space: pre-wrap; }
         .metric-box { background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; }
         .stock-card { cursor: pointer; transition: 0.2s; } .stock-card:hover { border-color: var(--acc); background: #1c2128; }
         .text-up { color: #f85149 !important; } .text-down { color: #3fb950 !important; }
         #chart-container { height: 450px; width: 100%; margin-top: 15px; }
+        .white-text { color: #ffffff !important; }  /* 强制白色 */
     </style>
 </head>
 <body>
-<nav class="navbar navbar-dark bg-dark mb-3"><div class="container-fluid"><span class="navbar-brand text-success fw-bold">🛰️ PRO-QUANT V9.1 兼容防卡版</span></div></nav>
+<nav class="navbar navbar-dark bg-dark mb-3"><div class="container-fluid"><span class="navbar-brand text-success fw-bold">🛰️ PRO-QUANT V11 满血复活版</span></div></nav>
 <div class="container-fluid px-4">
     <div class="row">
         <div class="col-lg-3">
@@ -469,12 +643,21 @@ HTML = '''<!DOCTYPE html>
                 <button class="btn btn-primary w-100" onclick="analyze()">🚀 执行侦测</button>
             </div></div>
             <div class="card"><div class="card-header-custom">📡 策略扫描</div><div class="card-body">
-                <button class="btn btn-outline-info w-100 mb-2" onclick="scan('short')">⚡ 短线</button>
-                <button class="btn btn-outline-success w-100 mb-2" onclick="scan('band')">🌊 波段</button>
-                <button class="btn btn-outline-warning w-100" onclick="scan('washout')">🛁 洗盘坑</button>
+                <button class="btn btn-outline-info w-100 mb-2" onclick="scan('short')">⚡ 短线突击</button>
+                <button class="btn btn-outline-success w-100 mb-2" onclick="scan('band')">🌊 中线波段</button>
+                <button class="btn btn-outline-warning w-100" onclick="scan('washout')">🛁 缩量洗盘坑</button>
             </div></div>
             <div class="card"><div class="card-header-custom">🛠️ 资产与回测</div><div class="card-body">
-                <!-- 持仓输入与回测组件，保持原样 -->
+                <div id="ports" class="mb-2"><div class="d-flex gap-1 mb-1"><input class="form-control form-control-sm p_code" placeholder="代码"><input class="form-control form-control-sm p_cost" placeholder="成本"><input class="form-control form-control-sm p_weight" placeholder="仓位%"></div></div>
+                <div class="d-flex justify-content-between mb-3">
+                    <button class="btn btn-sm btn-outline-secondary" onclick="addPort()">+加一行</button>
+                    <button class="btn btn-sm btn-success" onclick="calcPort()">运算组合</button>
+                </div>
+                <hr class="border-secondary">
+                <select id="bt_strat" class="form-select form-select-sm mb-1"><option value="washout">洗盘策略</option><option value="short">短线策略</option><option value="band">波段策略</option></select>
+                <input type="date" id="bt_date" class="form-control form-control-sm mb-1">
+                <select id="bt_hold" class="form-select form-select-sm mb-2"><option value="1">持有1天</option><option value="3">持有3天</option><option value="5">持有5天</option></select>
+                <button class="btn btn-sm btn-outline-danger w-100" onclick="runBt()">⏳ 历史回测</button>
             </div></div>
         </div>
         <div class="col-lg-9">
@@ -484,7 +667,9 @@ HTML = '''<!DOCTYPE html>
     </div>
 </div>
 <script>
-    // 前端超时控制（5秒）
+    document.getElementById('bt_date').value = new Date().toISOString().slice(0,10);
+    let kChart = null;
+
     async function analyze() {
         const stock = document.getElementById('s_code').value, cost = document.getElementById('s_cost').value;
         if(!stock) return;
@@ -517,12 +702,86 @@ HTML = '''<!DOCTYPE html>
             document.getElementById('displayArea').innerHTML = '<div class="alert alert-warning">⏰ 请求超时，请检查网络后重试</div>';
         }
     }
-    // 图表渲染及其他辅助函数（出于篇幅省略，完整代码中包含所有交互）
+
+    function renderChart(data) {
+        const kLineData = data.map(i => ({ x: new Date(i.date).getTime(), y: [i.open, i.high, i.low, i.close] }));
+        const ma20Data = data.map(i => ({ x: new Date(i.date).getTime(), y: i.ma20 }));
+        const volData = data.map(i => ({ x: new Date(i.date).getTime(), y: i.volume, fillColor: i.close >= i.open ? 'rgba(248,81,73,0.5)' : 'rgba(63,185,80,0.5)' }));
+
+        const options = {
+            series: [
+                { name: 'K线', type: 'candlestick', data: kLineData },
+                { name: 'MA20', type: 'line', data: ma20Data },
+                { name: '成交量', type: 'column', data: volData }
+            ],
+            chart: { height: 450, type: 'line', background: 'transparent', toolbar: { show: false }, stacked: false },
+            theme: { mode: 'dark' },
+            stroke: { width: [1, 2, 1], curve: 'smooth' },
+            colors: ['#fff', '#00e676', '#00e676'],
+            plotOptions: {
+                candlestick: { colors: { upward: '#f85149', downward: '#3fb950' }, wick: { useFillColor: true } },
+                bar: { columnWidth: '80%', borderRadius: 0 }
+            },
+            xaxis: { type: 'datetime', labels: { style: { colors: '#8b949e' } } },
+            yaxis: [
+                { seriesName: 'K线', title: { text: '价格', style: { color: '#8b949e' } }, labels: { style: { colors: '#8b949e' } } },
+                { seriesName: '成交量', opposite: true, title: { text: '成交量(手)', style: { color: '#8b949e' } }, labels: { style: { colors: '#8b949e' } }, min: 0 }
+            ],
+            grid: { borderColor: '#30363d', strokeDashArray: 3 },
+            legend: { position: 'top', horizontalAlign: 'left' }
+        };
+        if(kChart) kChart.destroy();
+        kChart = new ApexCharts(document.querySelector("#chart-container"), options);
+        kChart.render();
+    }
+
+    async function scan(strategy) {
+        document.getElementById('loader').style.display = 'block';
+        const res = await fetch('/scan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({strategy}) });
+        const data = await res.json();
+        document.getElementById('loader').style.display = 'none';
+        let html = `<h5 class="mb-3 text-white border-bottom border-secondary pb-2">🎯 扫描结果</h5><div class="row g-2">`;
+        if(!data.results || data.results.length === 0) html += "<div class='text-secondary'>未扫描到标的</div>";
+        data.results.forEach(r => { html += `<div class="col-md-6"><div class="card p-2 stock-card h-100" onclick="quickAnalyze('${r.code}')"><div class="d-flex justify-content-between mb-1"><strong class="text-white">${r.name}</strong><span class="text-success small">${r.score}分</span></div><div class="text-secondary" style="font-size:12px;">现价: ${r.close} | 介入位: ${r.advice.介入价}</div></div></div>`; });
+        html += '</div>';
+        document.getElementById('displayArea').innerHTML = html;
+    }
+
+    function quickAnalyze(code) { document.getElementById('s_code').value = code; analyze(); }
+
+    function addPort() {
+        const div = document.createElement('div'); div.className = 'd-flex gap-1 mb-1';
+        div.innerHTML = '<input class="form-control form-control-sm p_code" placeholder="代码"><input class="form-control form-control-sm p_cost" placeholder="成本"><input class="form-control form-control-sm p_weight" placeholder="仓位%">';
+        document.getElementById('ports').appendChild(div);
+    }
+
+    async function calcPort() {
+        const rows = document.querySelectorAll('#ports .d-flex');
+        const holdings = [];
+        rows.forEach(r => {
+            const code = r.querySelector('.p_code').value.trim(), cost = r.querySelector('.p_cost').value, weight = r.querySelector('.p_weight').value;
+            if(code) holdings.push({code, cost: cost||0, weight: weight||0});
+        });
+        document.getElementById('loader').style.display = 'block';
+        const res = await fetch('/portfolio', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({holdings}) });
+        const data = await res.json();
+        document.getElementById('loader').style.display = 'none';
+        document.getElementById('displayArea').innerHTML = `<h5 class="text-white">🛠️ 持仓组合结算</h5><pre class="terminal-box white-text">${data.report || data.error}</pre>`;
+    }
+
+    async function runBt() {
+        const strategy = document.getElementById('bt_strat').value, date = document.getElementById('bt_date').value, hold_days = document.getElementById('bt_hold').value;
+        document.getElementById('loader').style.display = 'block';
+        const res = await fetch('/backtest', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({strategy, date, hold_days}) });
+        const data = await res.json();
+        document.getElementById('loader').style.display = 'none';
+        document.getElementById('displayArea').innerHTML = `<h5 class="text-white">⏳ 历史回测报告</h5><pre class="terminal-box white-text">${data.report || data.error}</pre>`;
+    }
 </script>
 </body>
 </html>'''
 
 if __name__ == '__main__':
-    print("⚡ PRO-QUANT V9.1 兼容防卡版启动")
-    print("👉 访问 http://127.0.0.1:10000")
+    print("⚡ PRO-QUANT V11 满血最终版 启动")
+    print("👉 浏览器访问: http://127.0.0.1:10000")
     app.run(host='0.0.0.0', port=10000)
