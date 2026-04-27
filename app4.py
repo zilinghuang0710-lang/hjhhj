@@ -3,14 +3,15 @@ import numpy as np
 import re
 import urllib3
 import requests
+import threading
 import time
-import random
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, render_template_string
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ================== 常量 ==================
+# ================== 常量配置 ==================
 KDJ_WINDOW = 9
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 RSI_PERIOD = 14
@@ -18,378 +19,560 @@ BOLL_PERIOD = 20
 BOLL_WIDTH = 2
 SUPPORT_RESIST_WINDOW = 20
 CHIP_DAYS = 60
-KLINE_LIMIT = 240
+KLINE_LIMIT = 120
 
 active_cache = {"data": None, "time": 0}
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-]
-
+# ================== 网络会话 (性能优化核心) ==================
 def create_session():
     session = requests.Session()
-    retry = urllib3.util.retry.Retry(total=2, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504])
-    adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    retry = urllib3.util.retry.Retry(total=1, backoff_factor=0.2, status_forcelist=[500, 502, 503, 504])
+    # 扩大连接池，打破线程并发的隐形枷锁
+    adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
-    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
     session.verify = False
     return session
 
 http_session = create_session()
 
-# ================== 真实本地兜底股票池（800只常见A股） ==================
-# 这里列举了沪深300及中证500主要成分，确保扫描永远有效
-REAL_STOCKS = [
-    {"code":"600519","name":"贵州茅台","sector":"酿酒"}, {"code":"000858","name":"五粮液","sector":"酿酒"},
-    {"code":"601318","name":"中国平安","sector":"保险"}, {"code":"300750","name":"宁德时代","sector":"电池"},
-    {"code":"688981","name":"中芯国际","sector":"半导体"}, {"code":"002400","name":"省广集团","sector":"传媒"},
-    {"code":"600030","name":"中信证券","sector":"券商"}, {"code":"000651","name":"格力电器","sector":"家电"},
-    {"code":"002415","name":"海康威视","sector":"安防"}, {"code":"601888","name":"中国中免","sector":"旅游"},
-    {"code":"601166","name":"兴业银行","sector":"银行"}, {"code":"000002","name":"万科A","sector":"地产"},
-    {"code":"600036","name":"招商银行","sector":"银行"}, {"code":"300059","name":"东方财富","sector":"互联网"},
-    {"code":"002594","name":"比亚迪","sector":"汽车"}, {"code":"601012","name":"隆基绿能","sector":"光伏"},
-    {"code":"600276","name":"恒瑞医药","sector":"医药"}, {"code":"000725","name":"京东方A","sector":"面板"},
-    {"code":"300015","name":"爱尔眼科","sector":"医疗"}, {"code":"603259","name":"药明康德","sector":"CRO"},
-    # ... 实际代码中包含完整800只，此处仅为示例，部署时请替换为完整列表
-]
-
+# ================== 活跃股票池 ==================
 def get_active_stocks(limit=200):
     global active_cache
     now = time.time()
     if active_cache["data"] is not None and (now - active_cache["time"]) < 1800:
         return active_cache["data"][:limit]
-
-    stocks = []
-    # 主源：东方财富
     try:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        url = "http://80.push2.eastmoney.com/api/qt/clist/get"
         params = {
-            "pn": "1", "pz": str(limit), "po": "1", "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
-            "fid": "f20", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-            "fields": "f12,f14,f10,f20,f100", "_": str(int(now*1000))
+            "pn": "1", "pz": str(min(limit+50, 500)),
+            "po": "1", "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2", "invt": "2", "fid": "f20",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f14,f2,f3,f10,f20,f21,f15,f100",
+            "_": str(int(time.time()*1000))
         }
-        resp = http_session.get(url, params=params, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=5).json()
-        if resp and resp.get("data") and resp["data"].get("diff"):
-            for item in resp["data"]["diff"]:
-                code, name = item.get("f12"), item.get("f14")
-                if not code or "ST" in name: continue
-                stocks.append({"code": code, "name": name, "volume_ratio": item.get("f20", 1), "sector": item.get("f100", "")})
-    except: pass
-
-    # 备用源：腾讯热点
-    if len(stocks) < 50:
-        try:
-            tx_url = "https://web.ifzq.gtimg.cn/appstock/app/rank/total?type=1&num=200"
-            tx_data = http_session.get(tx_url, timeout=5).json()
-            if tx_data and tx_data.get("data"):
-                for stock in tx_data["data"].get("stocks", []):
-                    code, name = stock.get("code"), stock.get("name")
-                    if code and "ST" not in name:
-                        stocks.append({"code": code, "name": name, "volume_ratio": 1.0, "sector": ""})
-        except: pass
-
-    # 最终兜底：真实800只股票池
-    if not stocks:
-        stocks = REAL_STOCKS
-
-    stocks = list({s['code']: s for s in stocks}.values())
-    active_cache["data"] = stocks
-    active_cache["time"] = now
-    return stocks[:limit]
+        resp = http_session.get(url, params=params, timeout=(2, 3))
+        data = resp.json()
+        if data and data.get("data") and data["data"].get("diff"):
+            stocks = []
+            for item in data["data"]["diff"]:
+                code = item.get("f12")
+                name = item.get("f14")
+                if not code: continue
+                f20 = item.get("f20", 0)
+                f10 = item.get("f10", 0)
+                if "ST" in name or f20 is None or f20 <= 0 or f10 is None:
+                    continue
+                sector = item.get("f100", "")
+                stocks.append({"code":code, "name":name, "volume_ratio":f20, "turnover":f10, "sector":sector})
+            stocks.sort(key=lambda x: x["volume_ratio"], reverse=True)
+            active_cache["data"] = stocks
+            active_cache["time"] = now
+            return stocks[:limit]
+    except:
+        pass
+    # 兜底
+    return [{"code":"600519","name":"贵州茅台","sector":"酿酒行业"},
+            {"code":"000858","name":"五粮液","sector":"酿酒行业"},
+            {"code":"601318","name":"中国平安","sector":"保险"},
+            {"code":"002400","name":"省广集团","sector":"文化传媒"},
+            {"code":"688981","name":"中芯国际","sector":"半导体"},
+            {"code":"300750","name":"宁德时代","sector":"电池"}]
 
 # ================== 股票搜索 ==================
 def resolve_stock_input(keyword):
     keyword = str(keyword).strip()
-    if re.match(r'^\d{6}$', keyword): return keyword, f"A股_{keyword}"
-    local = {
-        "省广集团":"002400", "sgjt":"002400", "贵州茅台":"600519", "gzmt":"600519",
-        "宁德时代":"300750", "ndsd":"300750", "中信证券":"600030", "zxzq":"600030",
-        "东方财富":"300059", "dfcf":"300059",
-    }
-    if keyword in local: return local[keyword], keyword
+    if re.match(r'^\d{6}$', keyword):
+        return keyword, f"A股_{keyword}"
+    offline = {"省广集团":"002400","sgjt":"002400","贵州茅台":"600519","gzmt":"600519",
+               "宁德时代":"300750","ndsd":"300750","中信证券":"600030","zxzq":"600030",
+               "东方财富":"300059","dfcf":"300059"}
+    if keyword in offline:
+        return offline[keyword], keyword
     try:
         resp = http_session.get("https://searchapi.eastmoney.com/api/suggest/get", params={
-            "input":keyword,"type":"14","token":"D43BF722C8E33BDC906FB84D85E326E8","count":"1"}, timeout=3)
+            "input":keyword,"type":"14","token":"D43BF722C8E33BDC906FB84D85E326E8","count":"1"}, timeout=2)
         if resp.status_code==200:
             data = resp.json()
-            if data and data.get("QuotationCodeTable") and data["QuotationCodeTable"]["Data"]:
+            if data["QuotationCodeTable"]["Data"]:
                 item = data["QuotationCodeTable"]["Data"][0]
                 return item["Code"], item["Name"]
     except: pass
+    try:
+        resp = http_session.get("http://smartbox.gtimg.cn/s3/", params={"v":2,"q":keyword,"t":"all"}, timeout=2)
+        resp.encoding='GBK'
+        m = re.search(r'v_hint="(.*?)"', resp.text)
+        if m:
+            parts = m.group(1).split('^')[0].split(',')
+            if len(parts)>=2:
+                code_m = re.search(r'\d{6}', parts[0])
+                if code_m:
+                    return code_m.group(0), parts[1]
+    except: pass
     return None, None
 
-# ================== K线分析引擎 ==================
+# ================== 分析引擎 ==================
 class StockAnalyzer:
     def __init__(self, symbol, name, cost_price=None):
-        self.symbol, self.name = symbol, name
+        self.symbol = symbol
+        self.name = name
         self.cost_price = float(cost_price) if cost_price else None
         self.df = pd.DataFrame()
-        self.weekly_df = pd.DataFrame()
         self.chip_peak = 0.0
 
     def fetch_data(self, end_date=None):
-        # 东财日线
         mkt = "0" if self.symbol.startswith(("0","3")) else "1"
-        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "secid": f"{mkt}.{self.symbol}",
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": "101", "fqt": "1",
-            "end": end_date if end_date else "20500101",
-            "lmt": str(KLINE_LIMIT)
-        }
+        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {"secid":f"{mkt}.{self.symbol}","fields1":"f1,f2,f3,f4,f5,f6",
+                  "fields2":"f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                  "klt":"101","fqt":"1","end":end_date if end_date else "20500101","lmt":str(KLINE_LIMIT)}
         try:
-            resp = http_session.get(url, params=params, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=5)
-            if resp.status_code==200:
-                data = resp.json()
-                if data and data.get("data") and data["data"].get("klines"):
-                    klines = data["data"]["klines"]
-                    if len(klines) >= 10:
-                        self.df = pd.DataFrame([{
-                            "date": p[0], "open": float(p[1]), "close": float(p[2]),
-                            "high": float(p[3]), "low": float(p[4]), "volume": float(p[5]),
-                            "turnover": float(p[10])
-                        } for p in (item.split(",") for item in klines)])
-                        return True
-        except: pass
-
-        # 腾讯备用
-        prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
-        tx_url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{self.symbol},day,,,{KLINE_LIMIT},qfq"
-        try:
-            resp = http_session.get(tx_url, timeout=5)
-            if resp.status_code==200:
-                data = resp.json()
-                if data and data.get("code")==0:
-                    stock_data = data["data"].get(f"{prefix}{self.symbol}")
-                    if stock_data:
-                        kline = stock_data.get("qfqday") or stock_data.get("day")
-                        if kline and len(kline) >= 10:
-                            self.df = pd.DataFrame([{
-                                "date": i[0], "open": float(i[1]), "close": float(i[2]),
-                                "high": float(i[3]), "low": float(i[4]), "volume": float(i[5]),
-                                "turnover": 0.0
-                            } for i in kline])
-                            return True
+            # 采用连接和读取双超时，防止单线程挂死
+            resp = http_session.get(url, params=params, timeout=(1.5, 2))
+            if resp.status_code==200 and "klines" in resp.json().get("data",{}):
+                klines = resp.json()["data"]["klines"]
+                parsed = [{"date":p[0],"open":float(p[1]),"close":float(p[2]),
+                           "high":float(p[3]),"low":float(p[4]),"volume":float(p[5]),
+                           "turnover":float(p[10])} for p in (item.split(",") for item in klines)]
+                self.df = pd.DataFrame(parsed)
+                return True
         except: pass
         return False
 
     def calculate_indicators(self):
-        if self.df.empty or len(self.df) < 10: return False
+        if self.df.empty or len(self.df) < 20: return False
         df = self.df
         df['MA5'] = df['close'].rolling(5).mean()
-        df['MA10'] = df['close'].rolling(10).mean()
         df['MA20'] = df['close'].rolling(20).mean()
         df['VMA5'] = df['volume'].rolling(5).mean()
-        l9, h9 = df['low'].rolling(9, min_periods=1).min(), df['high'].rolling(9, min_periods=1).max()
+        
+        # KDJ
+        l9 = df['low'].rolling(9, min_periods=1).min()
+        h9 = df['high'].rolling(9, min_periods=1).max()
         denom = h9 - l9
         rsv = np.where(denom==0, 50, (df['close']-l9)/denom*100)
         df['K'] = pd.Series(rsv, index=df.index).ewm(com=2, adjust=False).mean()
         df['D'] = df['K'].ewm(com=2, adjust=False).mean()
         df['J'] = 3*df['K'] - 2*df['D']
+        
+        # MACD
+        ema12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['DIF'] = ema12 - ema26
+        df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
+        df['MACD'] = 2*(df['DIF'] - df['DEA'])
+        
+        # 支撑压力
         df['Support'] = df['low'].rolling(20).min()
         df['Resistance'] = df['high'].rolling(20).max()
-
+        
+        # 筹码峰
         recent = df.tail(60)
-        if not recent.empty and recent['close'].max() > recent['close'].min():
-            bins = np.linspace(recent['close'].min(), recent['close'].max(), 11)
-            try:
-                dist = recent.groupby(pd.cut(recent['close'], bins=bins), observed=False)['volume'].sum()
-            except TypeError:
-                dist = recent.groupby(pd.cut(recent['close'], bins=bins))['volume'].sum()
-            self.chip_peak = dist.idxmax().mid if not dist.empty else recent['close'].iloc[-1]
-
-        # 周线合成
-        try:
-            df['date_dt'] = pd.to_datetime(df['date'])
-            weekly = df.set_index('date_dt').resample('W-FRI').agg({
-                'open':'first','high':'max','low':'min','close':'last','volume':'sum'
-            }).dropna()
-            if len(weekly) >= 2:
-                weekly['MA5'] = weekly['close'].rolling(5).mean()
-                weekly['MA10'] = weekly['close'].rolling(10).mean()
-                weekly['VMA5'] = weekly['volume'].rolling(5).mean()
-                lw = weekly['low'].rolling(9,min_periods=1).min()
-                hw = weekly['high'].rolling(9,min_periods=1).max()
-                dw = hw - lw
-                rsv_w = np.where(dw==0,50,(weekly['close']-lw)/dw*100)
-                weekly['K'] = pd.Series(rsv_w, index=weekly.index).ewm(com=2, adjust=False).mean()
-                weekly['D'] = weekly['K'].ewm(com=2, adjust=False).mean()
-                weekly['J'] = 3*weekly['K'] - 2*weekly['D']
-                self.weekly_df = weekly.replace([np.inf, -np.inf], np.nan).fillna(0)
-        except: pass
-
-        self.df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        if not recent.empty:
+            mn, mx = recent['close'].min(), recent['close'].max()
+            if mx > mn:
+                bins = np.linspace(mn, mx, 11)
+                try: dist = recent.groupby(pd.cut(recent['close'], bins=bins, observed=False))['volume'].sum()
+                except TypeError: dist = recent.groupby(pd.cut(recent['close'], bins=bins))['volume'].sum()
+                self.chip_peak = dist.idxmax().mid if not dist.empty else recent['close'].iloc[-1]
+                
+        # 强力清理脏数据，防止 JSON 解析崩溃
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        self.df = df
         return True
 
     def get_full_report(self):
-        if not self.calculate_indicators(): return {"error": "数据不足"}
+        if not self.calculate_indicators():
+            return {"error": "数据不足或计算异常"}
         latest = self.df.iloc[-1]
         prev = self.df.iloc[-2]
         vol_ratio = latest['volume'] / (latest['VMA5'] if latest['VMA5'] > 0 else 1)
         is_wash, _, _ = self.is_washout_pattern()
+        
         intent = "区间震荡"
-        if latest['close'] > prev['close'] and vol_ratio > 1.3: intent = "放量启动"
+        if latest['close'] > prev['close'] and vol_ratio > 1.5: intent = "放量启动"
         elif is_wash: intent = "缩量洗盘"
+        elif latest['close'] < prev['close'] and vol_ratio > 1.8: intent = "恐慌砸盘"
 
-        diag = []
-        if self.cost_price and self.cost_price > 0:
-            if self.cost_price <= self.chip_peak:
-                diag.append("✅ [筹码优势] 你的成本在主力筹码峰下方或附近，具备战略优势。")
-            else:
-                diag.append("⚠️ [筹码劣势] 你的成本高于主筹码峰，极易成为主力洗盘对象。")
-        else:
-            diag.append("ℹ️ [筹码信息] 未提供持仓成本，跳过筹码成本比较。")
-        if latest['volume'] <= latest['VMA5'] * 1.1:
-            diag.append("✅ [量价特征] 成交量平稳或萎缩，符合\"抛压枯竭\"洗盘特征。")
-        elif latest['volume'] > latest['VMA5'] * 1.5:
-            diag.append("🚀 [攻击信号] 出现带量突破，主力疑似点火拉升！")
-        if latest['J'] < 20:
-            diag.append("✅ [技术反弹] J值极度超卖 (<20)，有反抽需求。")
-        elif latest['J'] > 80:
-            diag.append("⚠️ [技术超买] J值高位钝化 (>80)，短线追高风险大。")
-
-        # 周线
-        week_text = ""
-        w_score = 0
-        if not self.weekly_df.empty and len(self.weekly_df) >= 2:
-            wl = self.weekly_df.iloc[-1]
-            w_ma_status = f"周线多头排列 (MA5 > MA10)" if wl['MA5'] > wl['MA10'] else f"周线空头排列 (MA5 < MA10)"
-            w_vol_ratio = wl['volume'] / (wl['VMA5'] if wl['VMA5']>0 else 1)
-            week_text = f"""  📊 周均线状态：{w_ma_status}
-  📈 周线KDJ  K:{wl['K']:.1f}  D:{wl['D']:.1f}  J:{wl['J']:.1f}
-  📊 本周成交量:{int(wl['volume'])}手  5周均量:{int(wl['VMA5'])}手  量比:{w_vol_ratio:.2f}
-  🧩 周线综合影响评分： {w_score}"""
-        else:
-            week_text = "  ⚠️ 未能生成有效周线数据，本次仅基于日线判断。"
-
-        advice = "🟡 综合评级：【谨慎观望】\n   核心逻辑：盘面混沌。以支撑位为底线，不破不走，不放量不加仓。"
-        if w_score >= 1 and str(diag).count('✅') >= 2:
-            advice = "🟢 综合评级：【积极做多 / 坚定持有】\n   核心逻辑：量价健康，筹码占优，靠近支撑。耐心等待主力放量突破。"
-        elif w_score < 0 and str(diag).count('⚠️') >= 2:
-            advice = "🔴 综合评级：【防守减仓】\n   核心逻辑：量价破位或处于强压力位下方，建议控仓防守。"
-
-        txt_report = f"""=======================================================
- 🤖 【{self.name} ({self.symbol})】 主力量价深度诊断（日线+周线）
-=======================================================
-【日线核心参数】
-🔸 最新收盘: {latest['close']:.2f} 元  |  🔸 持仓成本: {self.cost_price if self.cost_price else '无'} 元
-🔸 支撑: {latest['Support']:.2f} | 压力: {latest['Resistance']:.2f} | 筹码峰: {self.chip_peak:.2f}
-🔸 KDJ(J): {latest['J']:.2f}  |  5日均量: {int(latest['VMA5'])}手  |  换手: {latest['turnover']:.2f}%
-
-【日线逻辑推演】
-  """ + "\n  ".join(diag) + f"""
-
-【周线中期趋势】
-{week_text}
-
->>> 最终操作建议 <<<
-{advice}
-==========================================="""
-
-        # 安全转换图表数据
         chart_data = []
         for _, row in self.df.tail(80).iterrows():
             chart_data.append({
                 "date": str(row['date']),
-                "open": float(row['open']), "high": float(row['high']),
-                "low": float(row['low']), "close": float(row['close']),
-                "ma5": float(row['MA5']), "ma20": float(row['MA20']),
-                "volume": int(row['volume'])
+                "open": float(round(row['open'], 2)), "high": float(round(row['high'], 2)),
+                "low": float(round(row['low'], 2)), "close": float(round(row['close'], 2)),
+                "ma5": float(round(row['MA5'], 2)), "ma20": float(round(row['MA20'], 2)),
+                "vol": float(round(row['volume'], 0))
             })
 
         return {
-            "name": self.name, "code": self.symbol, "price": round(latest['close'],2),
-            "change": round((latest['close']-prev['close'])/prev['close']*100,2),
-            "kdj": {"K":round(latest['K'],1),"D":round(latest['D'],1),"J":round(latest['J'],1)},
-            "vol_ratio": round(vol_ratio,2), "intent": intent,
+            "name": self.name, "code": self.symbol,
+            "price": float(round(latest['close'], 2)),
+            "change": float(round((latest['close']-prev['close'])/prev['close']*100, 2)),
+            "kdj": {"K":float(round(latest['K'],1)),"D":float(round(latest['D'],1)),"J":float(round(latest['J'],1))},
+            "vol_ratio": float(round(vol_ratio, 2)),
+            "intent": intent,
             "score": 85 if intent in ["放量启动","缩量洗盘"] else 50,
-            "text_report": txt_report, "chart_data": chart_data
+            "support": float(round(latest['Support'],2)),
+            "resistance": float(round(latest['Resistance'],2)),
+            "chip_peak": float(round(self.chip_peak, 2)),
+            "chart_data": chart_data
         }
 
     def is_washout_pattern(self):
-        if len(self.df) < 40: return False,0,""
-        df40 = self.df.tail(40)
-        if df40['high'].max() / (df40['close'].iloc[0]+0.01) < 1.06: return False,0,""
-        if (self.df.tail(10)['high'].max()-self.df.tail(10)['low'].min())/(self.df.tail(10)['low'].min()+0.01) > 0.18: return False,0,""
-        if self.df['volume'].tail(5).mean()/(df40['volume'].iloc[0:20].mean()+0.01) > 0.85: return False,0,""
-        return True,80,"缩量洗盘"
+        if len(self.df) < 40: return False, 0, ""
+        df = self.df.tail(40)
+        price_start = df['close'].iloc[0]
+        price_peak = df['high'].max()
+        if price_peak / (price_start+0.01) < 1.10: return False, 0, ""
+        recent10 = df.tail(10)
+        if (recent10['high'].max()-recent10['low'].min())/(recent10['low'].min()+0.01) > 0.12: return False, 0, ""
+        vol_rise = df['volume'].iloc[0:20].mean()
+        vol_now = df['volume'].tail(5).mean()
+        if vol_now / (vol_rise+0.01) > 0.8: return False, 0, ""
+        return True, 80, "缩量洗盘成功"
 
     def score_band(self):
-        latest = self.df.iloc[-1]
+        df = self.df
+        latest = df.iloc[-1]
         score = 0
-        if latest['MA5'] > latest['MA20']: score += 2
-        if latest['close'] > latest['MA20']: score += 1
-        if 20 < latest['J'] < 80: score += 1
+        if df['MA5'].iloc[-1] > df['MA20'].iloc[-1]: score += 2
+        if latest['close'] > df['MA20'].iloc[-1]: score += 2
+        if latest['J'] > 30 and latest['J'] < 70: score += 1
         return score
 
-# ================== 扫描（仅扫描200只真实活跃股） ==================
-def analyze_single_scan(code, strategy, name, sector):
-    az = StockAnalyzer(code, name)
-    if not az.fetch_data() or not az.calculate_indicators(): return None
-    latest = az.df.iloc[-1]
+# ================== 扫描/选股 ==================
+def analyze_single(code, strategy, name, sector):
+    analyzer = StockAnalyzer(code, name)
+    if not analyzer.fetch_data() or not analyzer.calculate_indicators():
+        return None
+    latest = analyzer.df.iloc[-1]
+    prev_close = latest['close']
+    prev_vol = analyzer.df.iloc[-2]['volume'] if len(analyzer.df)>1 else latest['volume']
+    bid_vol_threshold = prev_vol * 0.05
+
     if strategy == "short":
         score = 0
-        if latest['J'] < 35: score += 2
-        if latest['close'] > az.df.iloc[-2]['close'] and latest['volume']/(latest['VMA5']+1) > 1.1: score += 2
-        if score < 2: return None
-        advice = {"介入价": f"{latest['close']*0.99:.2f}", "风格": "一日游"}
+        if latest['J'] < 20: score += 3
+        if latest['close'] > analyzer.df.iloc[-2]['close'] and latest['volume']/(latest['VMA5']+1) > 1.5: score += 3
+        advice = {"介入价":f"{latest['close']*0.98:.2f}","止损价":f"{latest['low']*0.97:.2f}",
+                  "走强确认":f"竞价量>{bid_vol_threshold:.0f}手且涨幅>3%", "风格":"一日游"}
     elif strategy == "band":
-        score = az.score_band()
-        if score < 2: return None
-        advice = {"介入价": f"{latest['MA20']*1.01:.2f}", "风格": "中线波段"}
+        score = analyzer.score_band()
+        advice = {"介入价":f"{latest['MA20']*1.01:.2f}","止损价":f"{latest['Support']*0.95:.2f}",
+                  "走强确认":"站上MA20且KDJ金叉", "风格":"波段"}
     else:
-        is_wash, score, _ = az.is_washout_pattern()
+        is_wash, score, _ = analyzer.is_washout_pattern()
         if not is_wash: return None
-        advice = {"介入价": f"{latest['Support']:.2f}", "风格": "洗盘低吸"}
-    return {"code":code, "name":name, "sector":sector, "score":score, "close":f"{latest['close']:.2f}", "advice":advice}
+        advice = {"介入价":f"{latest['Support']:.2f}","止损价":f"{latest['Support']*0.96:.2f}",
+                  "走强确认":"缩量止跌后放量阳线", "风格":"洗盘低吸"}
+    return {"code":code,"name":name,"sector":sector,"score":score,"close":f"{latest['close']:.2f}","advice":advice}
 
 def scan_stocks(strategy, top_n=10):
-    stocks = get_active_stocks(200)          # 仅扫描前200只活跃股
+    stocks = get_active_stocks(200)
     results = []
-    ex = ThreadPoolExecutor(max_workers=8)   # 适当并发
-    futures = {ex.submit(analyze_single_scan, s["code"], strategy, s["name"], s["sector"]): s for s in stocks}
-    for f in as_completed(futures):
-        res = f.result()
-        if res:
-            results.append(res)
-            if len(results) >= top_n + 5:    # 凑够立刻停止
-                break
-    ex.shutdown(wait=False)
+    # 并发数拉升，结合优化的连接池，大幅度提升扫描速度
+    with ThreadPoolExecutor(max_workers=50) as ex:
+        futures = {ex.submit(analyze_single, s["code"], strategy, s["name"], s["sector"]): s for s in stocks}
+        for f in as_completed(futures):
+            res = f.result()
+            if res: results.append(res)
     results.sort(key=lambda x: x['score'], reverse=True)
     return results[:top_n]
 
-# ================== 回测（含真实日期处理） ==================
-BACKTEST_POOL = ["600519","000858","601318","000002","600036","601166","002400","300750","688981","600030","300059"]
-def run_backtest(strategy, test_date_str, hold_days=1):
-    end_date = test_date_str.replace("-","")
-    test_date = pd.to_datetime(test_date_str)
+def analyze_hot_stocks():
+    top = get_active_stocks(20)
     results = []
-    for code in BACKTEST_POOL:
-        az = StockAnalyzer(code, f"BT_{code}")
-        if not az.fetch_data(end_date=end_date) or not az.calculate_indicators(): continue
-        valid = False
-        if strategy == "short" and az.df.iloc[-1]['J'] < 35: valid = True
-        elif strategy == "band" and az.score_band() >= 2: valid = True
-        elif strategy == "washout" and az.is_washout_pattern()[0]: valid = True
-        if not valid: continue
-        full = StockAnalyzer(code, f"FULL_{code}")
-        if not full.fetch_data(): continue
-        future = full.df[full.df['date'] > str(test_date.date())].head(hold_days)
-        if len(future) < hold_days: continue
-        buy_price = full.df[full.df['date'] <= str(test_date.date())].iloc[-1]['close']
-        sell_price = future.iloc[-1]['close']
-        profit = (sell_price - buy_price) / buy_price * 100
-        results.append({"code":code, "name":full.name, "profit": profit, "success": profit > 0})
-    if not results: return None
-    acc = sum(1 for r in results if r['success'])/len(results)*100
-    return {"date":test_date_str, "strategy":strategy, "hold":hold_days, "total":len(results), "accuracy":acc, "picks":results}
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(StockAnalyzer(s["code"], s["name"]).fetch_data): s for s in top}
+        for f in as_completed(futures):
+            s = futures[f]
+            az = StockAnalyzer(s["code"], s["name"])
+            if f.result() and az.calculate_indicators():
+                r = az.get_full_report()
+                if "error" not in r:
+                    results.append({"code":az.symbol,"name":az.name,"sector":s.get("sector",""),
+                                    "price":r["price"],"change":r["change"],"intent":r["intent"],
+                                    "score":r["score"],"kdj_j":r["kdj"]["J"],"vol_ratio":r["vol_ratio"]})
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results
 
-# ================== Flask ==================
+# ================== Flask 应用与 HTML 模板 ==================
+HTML = '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PRO-QUANT 全功能量价终端 V5.7 (极速修复版)</title>
+    <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+    <style>
+        :root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #c9d1d9; --acc: #2ea043; --red: #f85149; }
+        body { background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; }
+        .navbar-custom { background: #010409; border-bottom: 1px solid var(--border); padding: 15px 0; }
+        .main-container { max-width: 1400px; margin: 2rem auto; padding: 0 15px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+        .card-header-custom { background: rgba(255,255,255,0.02); border-bottom: 1px solid var(--border); padding: 15px 20px; font-weight: bold; border-radius: 12px 12px 0 0; }
+        .btn-primary { background: var(--acc); border: none; font-weight: 600; }
+        .btn-primary:hover { background: #3fb950; }
+        .form-control { background: #010409; border: 1px solid var(--border); color: #fff; }
+        .form-control:focus { background: #010409; color: #fff; border-color: var(--acc); box-shadow: none; }
+        
+        .metric-box { background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 15px; text-align: center; }
+        .metric-title { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+        .metric-value { font-size: 24px; font-weight: 700; color: #f0f6fc; }
+        
+        .stock-card { cursor: pointer; transition: 0.2s; border-left: 4px solid transparent; }
+        .stock-card:hover { border-color: var(--acc); transform: translateX(5px); background: #1c2128; }
+        .text-up { color: #f85149 !important; } 
+        .text-down { color: #3fb950 !important; } 
+        
+        .loader-overlay { display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(13,17,23,0.8); z-index: 10; justify-content: center; align-items: center; border-radius: 12px; }
+        #chart-container { height: 400px; width: 100%; margin-top: 10px; display: block; position: relative; }
+    </style>
+</head>
+<body>
+
+<nav class="navbar-custom">
+    <div class="container-fluid px-4">
+        <span class="text-success fw-bold fs-4">🛰️ PRO-QUANT COMMAND CENTER V5.7</span>
+    </div>
+</nav>
+
+<div class="main-container">
+    <div class="row">
+        <div class="col-lg-3">
+            <div class="card position-relative">
+                <div class="card-header-custom">🎯 标的解析引擎</div>
+                <div class="card-body">
+                    <input type="text" id="stockCode" class="form-control mb-3" placeholder="股票名称/代码/拼音" value="省广集团">
+                    <input type="number" id="costPrice" class="form-control mb-3" placeholder="持仓成本(可选)">
+                    <button class="btn btn-primary w-100 py-2" onclick="analyze()">🚀 执行全维度诊断</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header-custom">🔍 策略扫描雷达</div>
+                <div class="card-body">
+                    <div class="d-grid gap-2">
+                        <button class="btn btn-outline-info" onclick="scan('short')">⚡ 短线突击 (一日游)</button>
+                        <button class="btn btn-outline-success" onclick="scan('band')">🌊 中线趋势 (波段)</button>
+                        <button class="btn btn-outline-warning" onclick="scan('washout')">🛁 洗盘识别 (黄金坑)</button>
+                    </div>
+                    <hr class="border-secondary my-4">
+                    <button class="btn btn-outline-danger w-100" onclick="hot()">🔥 异动热点 Top20</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-9">
+            <div class="card position-relative" style="min-height: 800px;">
+                <div class="loader-overlay" id="mainLoader">
+                    <div class="spinner-border text-success" role="status"></div>
+                </div>
+                
+                <div class="card-header-custom d-flex justify-content-between align-items-center">
+                    <span>📺 可视化情报看板</span>
+                    <span id="updateTime" class="badge bg-secondary">等待指令</span>
+                </div>
+                
+                <div class="card-body" id="displayArea">
+                    <div class="text-center text-secondary mt-5 pt-5">
+                        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="mb-3">
+                            <path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"></path><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"></path><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"></path>
+                        </svg>
+                        <h5>系统就绪，请在左侧输入标的或启动雷达扫描</h5>
+                        <p class="small">Interactive Charting Engine Powered by ApexCharts</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let klineChart = null;
+
+    function showLoader() { document.getElementById('mainLoader').style.display = 'flex'; }
+    function hideLoader() { document.getElementById('mainLoader').style.display = 'none'; }
+    function updateTime() { document.getElementById('updateTime').innerText = new Date().toLocaleTimeString(); }
+
+    async function analyze() {
+        const stock = document.getElementById('stockCode').value;
+        const cost = document.getElementById('costPrice').value;
+        if(!stock) return;
+        
+        // 渲染前清理历史图表残余，防冲突
+        if(klineChart) { klineChart.destroy(); klineChart = null; }
+        
+        showLoader();
+        try {
+            const res = await fetch('/analyze', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({stock, cost})
+            });
+            const data = await res.json();
+            hideLoader();
+            updateTime();
+
+            if(data.error) {
+                document.getElementById('displayArea').innerHTML = `<div class="alert alert-danger">❌ ${data.error}</div>`;
+                return;
+            }
+            
+            const r = data.report;
+            const colorClass = r.change >= 0 ? 'text-up' : 'text-down';
+            const intentColor = r.intent === '缩量洗盘' ? '#3fb950' : (r.intent === '恐慌砸盘' ? '#f85149' : '#58a6ff');
+
+            let html = `
+                <div class="d-flex justify-content-between align-items-end mb-4">
+                    <div>
+                        <h2 class="mb-0 text-white">${r.name} <span class="fs-5 text-secondary">${r.code}</span></h2>
+                        <div class="mt-2 text-secondary">支撑: ${r.support} | 压力: ${r.resistance} | 筹码密集峰: ${r.chip_peak}</div>
+                    </div>
+                    <div class="text-end">
+                        <h1 class="${colorClass} mb-0">${r.price}</h1>
+                        <span class="${colorClass} fs-5">${r.change >= 0 ? '+'+r.change : r.change}%</span>
+                    </div>
+                </div>
+
+                <div class="row g-3 mb-4">
+                    <div class="col-md-3"><div class="metric-box"><div class="metric-title">主力意图</div><div class="metric-value" style="color:${intentColor}">${r.intent}</div></div></div>
+                    <div class="col-md-3"><div class="metric-box"><div class="metric-title">KDJ (J值)</div><div class="metric-value">${r.kdj.J}</div></div></div>
+                    <div class="col-md-3"><div class="metric-box"><div class="metric-title">动能量比</div><div class="metric-value">${r.vol_ratio}</div></div></div>
+                    <div class="col-md-3"><div class="metric-box"><div class="metric-title">策略评分</div><div class="metric-value text-success">${r.score}</div></div></div>
+                </div>
+                
+                <div id="chart-container"></div>
+            `;
+            document.getElementById('displayArea').innerHTML = html;
+            
+            // 延时保障DOM结构已完全挂载，防止图表渲染找不到容器
+            setTimeout(() => { renderChart(r.chart_data); }, 100);
+            
+        } catch(e) {
+            hideLoader();
+            document.getElementById('displayArea').innerHTML = `<div class="alert alert-danger">❌ 请求失败:网络异常或服务已中断</div>`;
+        }
+    }
+
+    function renderChart(chartData) {
+        if(!chartData || chartData.length === 0) return;
+        
+        const seriesData = chartData.map(item => ({
+            x: new Date(item.date).getTime(),
+            y: [item.open, item.high, item.low, item.close]
+        }));
+        
+        const ma5Data = chartData.map(item => ({ x: new Date(item.date).getTime(), y: item.ma5 }));
+        const ma20Data = chartData.map(item => ({ x: new Date(item.date).getTime(), y: item.ma20 }));
+
+        const options = {
+            series: [
+                { name: 'K线', type: 'candlestick', data: seriesData },
+                { name: 'MA5', type: 'line', data: ma5Data },
+                { name: 'MA20', type: 'line', data: ma20Data }
+            ],
+            chart: { height: 400, type: 'line', background: 'transparent', toolbar: { show: true, tools: { download: false } } },
+            theme: { mode: 'dark' },
+            stroke: { width: [1, 2, 2], curve: 'smooth' },
+            colors: ['#ffffff', '#f4ce14', '#00e676'], 
+            plotOptions: {
+                candlestick: {
+                    colors: { upward: '#f85149', downward: '#3fb950' },
+                    wick: { useFillColor: true }
+                }
+            },
+            xaxis: { type: 'datetime', labels: { style: { colors: '#8b949e' }, datetimeUTC: false } },
+            yaxis: { tooltip: { enabled: true }, labels: { style: { colors: '#8b949e' } } },
+            grid: { borderColor: '#30363d', strokeDashArray: 3 },
+            // 【核心修复】移除引发越界崩溃的 custom 数组，恢复自带的平滑 tooltip
+            tooltip: { shared: true }, 
+            legend: { position: 'top', horizontalAlign: 'left' }
+        };
+
+        if(klineChart) { klineChart.destroy(); }
+        klineChart = new ApexCharts(document.querySelector("#chart-container"), options);
+        klineChart.render();
+    }
+
+    async function scan(strategy) {
+        showLoader();
+        try {
+            const res = await fetch('/scan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({strategy}) });
+            const data = await res.json();
+            hideLoader();
+            updateTime();
+
+            let title = strategy === 'short' ? '⚡ 短线突击榜' : (strategy === 'band' ? '🌊 中线波段榜' : '🛁 洗盘黄金坑');
+            let html = `<h4 class="mb-4 text-white border-bottom border-secondary pb-2">${title}</h4><div class="row g-3">`;
+            
+            data.results.forEach(r => {
+                html += `
+                <div class="col-md-6">
+                    <div class="card p-3 stock-card h-100" onclick="quickAnalyze('${r.code}')">
+                        <div class="d-flex justify-content-between mb-2">
+                            <strong class="text-white fs-5">${r.name}</strong>
+                            <span class="badge bg-success fs-6">${r.score} 分</span>
+                        </div>
+                        <div class="text-secondary small mb-2">${r.code} | ${r.sector || '板块未知'}</div>
+                        <div class="d-flex justify-content-between align-items-center mt-auto border-top border-secondary pt-2">
+                            <span class="text-white">现价 <b class="fs-5">${r.close}</b></span>
+                            <span class="text-info small">介入位参考: ${r.advice.介入价}</span>
+                        </div>
+                    </div>
+                </div>`;
+            });
+            html += '</div>';
+            document.getElementById('displayArea').innerHTML = html;
+        } catch(e) {
+            hideLoader();
+        }
+    }
+
+    async function hot() {
+        showLoader();
+        try {
+            const res = await fetch('/hot');
+            const data = await res.json();
+            hideLoader();
+            updateTime();
+
+            let html = `<h4 class="mb-4 text-danger border-bottom border-secondary pb-2">🔥 市场资金异动 Top20 (按量比排序)</h4><div class="row g-3">`;
+            data.stocks.forEach(r => {
+                const colorClass = r.change >= 0 ? 'text-up' : 'text-down';
+                html += `
+                <div class="col-md-6">
+                    <div class="card p-3 stock-card h-100" onclick="quickAnalyze('${r.code}')">
+                        <div class="d-flex justify-content-between mb-2">
+                            <strong class="text-white fs-5">${r.name}</strong>
+                            <strong class="${colorClass} fs-5">${r.change >= 0 ? '+'+r.change : r.change}%</strong>
+                        </div>
+                        <div class="row text-secondary small text-center mt-2">
+                            <div class="col-4 border-end border-secondary">量比<br><b class="text-warning">${r.vol_ratio}</b></div>
+                            <div class="col-4 border-end border-secondary">J值<br><b class="text-white">${r.kdj_j}</b></div>
+                            <div class="col-4">意图<br><b class="text-info">${r.intent}</b></div>
+                        </div>
+                    </div>
+                </div>`;
+            });
+            html += '</div>';
+            document.getElementById('displayArea').innerHTML = html;
+        } catch(e) {
+            hideLoader();
+        }
+    }
+
+    function quickAnalyze(code) {
+        document.getElementById('stockCode').value = code;
+        analyze();
+    }
+</script>
+</body>
+</html>'''
+
 app = Flask(__name__)
 
 @app.route('/')
@@ -398,239 +581,26 @@ def home(): return render_template_string(HTML)
 @app.route('/analyze', methods=['POST'])
 def analyze():
     d = request.get_json()
-    code, name = resolve_stock_input(d.get('stock'))
-    if not code: return jsonify({"error":"无法识别股票"})
+    stock_input = d.get('stock')
+    code, name = resolve_stock_input(stock_input)
+    if not code: return jsonify({"error":"无法识别股票，请检查输入"})
     az = StockAnalyzer(code, name, d.get('cost'))
-    if not az.fetch_data(): return jsonify({"error":"行情获取失败"})
+    if not az.fetch_data(): return jsonify({"error":"行情接口访问超时，请稍后重试"})
     rep = az.get_full_report()
-    if "error" in rep: return jsonify(rep)
     return jsonify({"report":rep})
 
 @app.route('/scan', methods=['POST'])
 def scan():
     strategy = request.get_json().get('strategy','washout')
-    return jsonify({"results": scan_stocks(strategy, 10)})
+    results = scan_stocks(strategy, 10)
+    return jsonify({"results":results})
 
-@app.route('/portfolio', methods=['POST'])
-def portfolio():
-    holdings = request.get_json().get('holdings',[])
-    if not holdings: return jsonify({"error":"请输入有效仓位"})
-    res_text = "📊 【持仓组合健康度分析】\n" + "="*40 + "\n"
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {}
-        for h in holdings:
-            code, _ = resolve_stock_input(h['code'])
-            if code: futures[ex.submit(StockAnalyzer(code, code).fetch_data)] = (code, float(h['cost']), float(h['weight']))
-        for f in as_completed(futures):
-            code, cost, weight = futures[f]
-            az = StockAnalyzer(code, code)
-            if f.result() and az.calculate_indicators():
-                curr_p = az.df.iloc[-1]['close']
-                profit_pct = (curr_p - cost)/cost*100
-                res_text += f"🔹 {code} 现价:{curr_p:.2f} 盈亏:{profit_pct:+.2f}% 状态:{'✅ 健康' if az.df.iloc[-1]['J']<80 else '⚠️ 高位'}\n"
-    res_text += "="*40
-    return jsonify({"report": res_text})
-
-@app.route('/backtest', methods=['POST'])
-def run_bt():
-    d = request.get_json()
-    res = run_backtest(d.get('strategy'), d.get('date'), int(d.get('hold_days')))
-    if not res: return jsonify({"error":"无信号"})
-    txt = f"📅 回测: {res['date']} | 策略: {res['strategy']} | 持有{res['hold']}天\n"
-    txt += f"🎯 信号数:{res['total']}  | 胜率:{res['accuracy']:.1f}%\n"+"-"*30+"\n"
-    for p in res['picks']: txt += f" {p['name']}({p['code']}) 收益:{p['profit']:+.2f}% {'✅' if p['success'] else '❌'}\n"
-    return jsonify({"report": txt})
-
-# ================== 前端 HTML（强对比度，稳定图表） ==================
-HTML = '''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PRO-QUANT 最终稳定版</title>
-    <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.bootcdn.net/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
-    <style>
-        :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#ffffff; --acc:#2ea043; }
-        body { background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; }
-        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 15px; }
-        .card-header-custom { background: rgba(255,255,255,0.02); border-bottom: 1px solid var(--border); padding: 12px 15px; font-weight: bold; }
-        .form-control, .form-select { background: #010409 !important; border: 1px solid var(--border) !important; color: #ffffff !important; }
-        .btn-primary { background: var(--acc); border: none; } .btn-primary:hover { background: #3fb950; }
-        .terminal-box { background: #010409; color: #00ff41; font-family: 'Consolas', monospace; padding: 15px; border-radius: 8px; border: 1px solid var(--border); font-size: 14px; white-space: pre-wrap; }
-        .metric-box { background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 10px; text-align: center; }
-        .stock-card { cursor: pointer; transition: 0.2s; } .stock-card:hover { border-color: var(--acc); background: #1c2128; }
-        .text-up { color: #f85149 !important; } .text-down { color: #3fb950 !important; }
-        #chart-container { height: 450px; width: 100%; margin-top: 15px; }
-        .white-text { color: #ffffff !important; }
-    </style>
-</head>
-<body>
-<nav class="navbar navbar-dark bg-dark mb-3 border-bottom border-secondary">
-    <div class="container-fluid"><span class="navbar-brand fw-bold text-success">🛰️ PRO-QUANT 最终稳定版</span></div>
-</nav>
-
-<div class="container-fluid px-4">
-    <div class="row">
-        <div class="col-lg-3">
-            <div class="card">
-                <div class="card-header-custom">🎯 个股侦测</div>
-                <div class="card-body">
-                    <input type="text" id="s_code" class="form-control mb-2 white-text" placeholder="代码/名称/拼音" value="省广集团">
-                    <input type="number" step="0.01" id="s_cost" class="form-control mb-3 white-text" placeholder="持仓成本(可选)">
-                    <button class="btn btn-primary w-100" onclick="analyze()">🚀 执行侦测</button>
-                </div>
-            </div>
-            <div class="card">
-                <div class="card-header-custom">📡 策略扫描</div>
-                <div class="card-body">
-                    <button class="btn btn-outline-info w-100 mb-2" onclick="scan('short')">⚡ 短线突击</button>
-                    <button class="btn btn-outline-success w-100 mb-2" onclick="scan('band')">🌊 中线波段</button>
-                    <button class="btn btn-outline-warning w-100" onclick="scan('washout')">🛁 缩量洗盘坑</button>
-                </div>
-            </div>
-            <div class="card">
-                <div class="card-header-custom">🛠️ 资产与回测</div>
-                <div class="card-body">
-                    <div id="ports" class="mb-2">
-                        <div class="d-flex gap-1 mb-1"><input class="form-control form-control-sm p_code white-text" placeholder="代码"><input class="form-control form-control-sm p_cost white-text" placeholder="成本"><input class="form-control form-control-sm p_weight white-text" placeholder="仓位%"></div>
-                    </div>
-                    <div class="d-flex justify-content-between mb-3">
-                        <button class="btn btn-sm btn-outline-secondary" onclick="addPort()">+加一行</button>
-                        <button class="btn btn-sm btn-success" onclick="calcPort()">运算组合</button>
-                    </div>
-                    <hr class="border-secondary">
-                    <select id="bt_strat" class="form-select form-select-sm mb-1"><option value="washout">洗盘策略</option><option value="short">短线策略</option><option value="band">波段策略</option></select>
-                    <input type="date" id="bt_date" class="form-control form-control-sm mb-1 white-text">
-                    <select id="bt_hold" class="form-select form-select-sm mb-2"><option value="1">持有1天</option><option value="3">持有3天</option><option value="5">持有5天</option></select>
-                    <button class="btn btn-sm btn-outline-danger w-100" onclick="runBt()">⏳ 历史回测</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="col-lg-9">
-            <div class="card" style="min-height:800px">
-                <div class="card-header-custom d-flex justify-content-between">
-                    <span>📺 情报大屏</span><span id="loader" class="text-success" style="display:none">处理中...</span>
-                </div>
-                <div class="card-body" id="displayArea">
-                    <div class="text-center text-secondary mt-5"><h3>等待指令...</h3></div>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<script>
-    document.getElementById('bt_date').value = new Date().toISOString().slice(0,10);
-    let kChart = null;
-
-    async function analyze() {
-        const stock = document.getElementById('s_code').value, cost = document.getElementById('s_cost').value;
-        if(!stock) return;
-        document.getElementById('loader').style.display = 'block';
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 12000);
-        try {
-            const res = await fetch('/analyze', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({stock,cost}), signal:controller.signal });
-            clearTimeout(timeout);
-            const data = await res.json();
-            document.getElementById('loader').style.display = 'none';
-            if(data.error) { document.getElementById('displayArea').innerHTML = `<div class="alert alert-danger">❌ ${data.error}</div>`; return; }
-            const r = data.report;
-            const color = r.change>=0?'text-up':'text-down';
-            let html = `<div class="d-flex justify-content-between align-items-end mb-3"><h3 class="text-white">${r.name} <span class="fs-6 text-secondary">${r.code}</span></h3><h2 class="${color}">${r.price} <span class="fs-6">${r.change>=0?'+'+r.change:r.change}%</span></h2></div>
-            <div class="row g-2 mb-3">
-                <div class="col-3"><div class="metric-box"><div class="metric-title">意图</div><div class="fw-bold text-info">${r.intent}</div></div></div>
-                <div class="col-3"><div class="metric-box"><div class="metric-title">KDJ J</div><div class="fw-bold">${r.kdj.J}</div></div></div>
-                <div class="col-3"><div class="metric-box"><div class="metric-title">量比</div><div class="fw-bold">${r.vol_ratio}</div></div></div>
-                <div class="col-3"><div class="metric-box"><div class="metric-title">评分</div><div class="fw-bold text-success">${r.score}</div></div></div>
-            </div>
-            <div id="chart-container"></div>
-            <button class="btn btn-sm btn-outline-secondary mt-3 w-100" data-bs-toggle="collapse" data-bs-target="#textReport">📄 展开全维度文本诊断</button>
-            <div class="collapse mt-2" id="textReport"><pre class="terminal-box">${r.text_report}</pre></div>`;
-            document.getElementById('displayArea').innerHTML = html;
-            renderChart(r.chart_data);
-        } catch(e) {
-            clearTimeout(timeout);
-            document.getElementById('loader').style.display = 'none';
-            document.getElementById('displayArea').innerHTML = '<div class="alert alert-warning">⏰ 请求超时，请检查网络后重试</div>';
-        }
-    }
-
-    function renderChart(data) {
-        if(!data || data.length===0) return;
-        const options = {
-            series: [
-                { name: 'K线', type: 'candlestick', data: data.map(i => ({ x: new Date(i.date).getTime(), y: [i.open, i.high, i.low, i.close] })) },
-                { name: 'MA20', type: 'line', data: data.map(i => ({ x: new Date(i.date).getTime(), y: i.ma20 })) },
-                { name: '成交量', type: 'column', data: data.map(i => ({ x: new Date(i.date).getTime(), y: i.volume, fillColor: i.close >= i.open ? 'rgba(248,81,73,0.5)' : 'rgba(63,185,80,0.5)' })) }
-            ],
-            chart: { height: 450, type: 'line', background: 'transparent', toolbar: { show: false }, stacked: false },
-            theme: { mode: 'dark' },
-            stroke: { width: [1, 2, 1] },
-            colors: ['#ffffff', '#00e676', '#00e676'],
-            plotOptions: { candlestick: { colors: { upward: '#f85149', downward: '#3fb950' }, wick: { useFillColor: true } }, bar: { columnWidth: '80%' } },
-            xaxis: { type: 'datetime', labels: { style: { colors: '#8b949e' } } },
-            yaxis: [
-                { seriesName: 'K线', title: { text: '价格', style: { color: '#8b949e' } }, labels: { style: { colors: '#8b949e' } } },
-                { seriesName: '成交量', opposite: true, title: { text: '成交量', style: { color: '#8b949e' } }, labels: { style: { colors: '#8b949e' } }, min: 0 }
-            ],
-            grid: { borderColor: '#30363d' },
-            legend: { position: 'top', horizontalAlign: 'left' }
-        };
-        if(kChart) kChart.destroy();
-        kChart = new ApexCharts(document.querySelector("#chart-container"), options);
-        kChart.render();
-    }
-
-    async function scan(strategy) {
-        document.getElementById('loader').style.display = 'block';
-        const res = await fetch('/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({strategy}) });
-        const data = await res.json();
-        document.getElementById('loader').style.display = 'none';
-        let html = `<h5 class="mb-3 text-white border-bottom border-secondary pb-2">🎯 扫描结果</h5><div class="row g-2">`;
-        if(!data.results || data.results.length===0) html += "<div class='text-secondary'>无符合条件的标的</div>";
-        data.results.forEach(r => { html += `<div class="col-md-6"><div class="card p-2 stock-card h-100" onclick="quickAnalyze('${r.code}')"><div class="d-flex justify-content-between mb-1"><strong class="text-white">${r.name}</strong><span class="text-success small">${r.score}分</span></div><div class="text-secondary" style="font-size:12px;">现价: ${r.close} | 介入位: ${r.advice.介入价}</div></div></div>`; });
-        html += '</div>';
-        document.getElementById('displayArea').innerHTML = html;
-    }
-
-    function quickAnalyze(code) { document.getElementById('s_code').value = code; analyze(); }
-
-    function addPort() {
-        const div = document.createElement('div'); div.className = 'd-flex gap-1 mb-1';
-        div.innerHTML = '<input class="form-control form-control-sm p_code white-text" placeholder="代码"><input class="form-control form-control-sm p_cost white-text" placeholder="成本"><input class="form-control form-control-sm p_weight white-text" placeholder="仓位%">';
-        document.getElementById('ports').appendChild(div);
-    }
-
-    async function calcPort() {
-        const rows = document.querySelectorAll('#ports .d-flex');
-        const holdings = [];
-        rows.forEach(r => {
-            const code = r.querySelector('.p_code').value.trim(), cost = r.querySelector('.p_cost').value, weight = r.querySelector('.p_weight').value;
-            if(code) holdings.push({code, cost: cost||0, weight: weight||0});
-        });
-        document.getElementById('loader').style.display = 'block';
-        const res = await fetch('/portfolio', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({holdings}) });
-        const data = await res.json();
-        document.getElementById('loader').style.display = 'none';
-        document.getElementById('displayArea').innerHTML = `<h5 class="text-white">🛠️ 持仓组合结算</h5><pre class="terminal-box white-text mt-3">${data.report || data.error}</pre>`;
-    }
-
-    async function runBt() {
-        const strategy = document.getElementById('bt_strat').value, date = document.getElementById('bt_date').value, hold_days = document.getElementById('bt_hold').value;
-        document.getElementById('loader').style.display = 'block';
-        const res = await fetch('/backtest', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({strategy, date, hold_days}) });
-        const data = await res.json();
-        document.getElementById('loader').style.display = 'none';
-        document.getElementById('displayArea').innerHTML = `<h5 class="text-white">⏳ 历史回测报告</h5><pre class="terminal-box white-text mt-3">${data.report || data.error}</pre>`;
-    }
-</script>
-</body>
-</html>'''
+@app.route('/hot')
+def hot():
+    stocks = analyze_hot_stocks()
+    return jsonify({"stocks":stocks})
 
 if __name__ == '__main__':
-    print("✅ 最终稳定版已启动，图表与文字颜色已修复")
-    print("👉 访问 http://127.0.0.1:10000")
+    print("✅ PRO-QUANT V5.7 (极速修复版) 已启动")
+    print("👉 请在浏览器中打开: http://127.0.0.1:10000")
     app.run(host='0.0.0.0', port=10000)
