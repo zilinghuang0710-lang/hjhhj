@@ -3,3 +3,4 @@ numpy
 requests
 urllib3
 flask
+matplotlib
