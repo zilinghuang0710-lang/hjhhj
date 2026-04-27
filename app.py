@@ -4,12 +4,13 @@ import re
 import urllib3
 import requests
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, render_template_string
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ================== 常量 ==================
+# ================== 常量配置 ==================
 KDJ_WINDOW = 9
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 RSI_PERIOD = 14
@@ -21,14 +22,21 @@ KLINE_LIMIT = 120
 
 active_cache = {"data": None, "time": 0}
 
-# ================== 网络会话 ==================
+# ================== 防反爬的随机标识池 ==================
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0"
+]
+
 def create_session():
     session = requests.Session()
-    retry = urllib3.util.retry.Retry(total=2, backoff_factor=0.2)
-    adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_connections=30, pool_maxsize=30)
+    retry = urllib3.util.retry.Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
+    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
     session.verify = False
     return session
 
@@ -42,7 +50,7 @@ def get_active_stocks(limit=400):
         return active_cache["data"][:limit]
 
     stocks = []
-    # 主源：东方财富
+    # 源1：东方财富
     try:
         url = "http://80.push2.eastmoney.com/api/qt/clist/get"
         params = {
@@ -68,7 +76,7 @@ def get_active_stocks(limit=400):
     except Exception as e:
         print(f"东财活跃股获取失败: {e}")
 
-    # 备用源：腾讯热点排行
+    # 源2：腾讯热点
     if len(stocks) < 50:
         try:
             tx_url = "http://web.ifzq.gtimg.cn/appstock/app/rank/total?type=1&num=200"
@@ -87,7 +95,7 @@ def get_active_stocks(limit=400):
         except Exception as e:
             print(f"腾讯热点获取失败: {e}")
 
-    # 最终本地备份
+    # 本地备份
     if not stocks:
         stocks = [
             {"code":"600519","name":"贵州茅台","sector":"酿酒"},
@@ -111,16 +119,27 @@ def get_active_stocks(limit=400):
             {"code":"300015","name":"爱尔眼科","sector":"医疗"},
             {"code":"603259","name":"药明康德","sector":"CRO"},
         ]
-
     stocks = list({s['code']: s for s in stocks}.values())
     active_cache["data"] = stocks
     active_cache["time"] = now
     return stocks[:limit]
 
-# ================== 股票搜索 ==================
+# ================== 股票搜索（三源） ==================
 def resolve_stock_input(keyword):
     keyword = str(keyword).strip()
     if re.match(r'^\d{6}$', keyword): return keyword, f"A股_{keyword}"
+
+    # 本地词库
+    local = {
+        "省广集团":"002400", "SGJT":"002400",
+        "贵州茅台":"600519", "GZMT":"600519",
+        "宁德时代":"300750", "NDSD":"300750",
+        "中信证券":"600030", "ZXZQ":"600030",
+        "东方财富":"300059", "DFCF":"300059",
+    }
+    if keyword in local: return local[keyword], keyword
+
+    # 源1：东方财富搜索
     try:
         resp = http_session.get("https://searchapi.eastmoney.com/api/suggest/get", params={
             "input":keyword,"type":"14","token":"D43BF722C8E33BDC906FB84D85E326E8","count":"1"}, timeout=3)
@@ -130,9 +149,22 @@ def resolve_stock_input(keyword):
                 item = data["QuotationCodeTable"]["Data"][0]
                 return item["Code"], item["Name"]
     except: pass
+
+    # 源2：腾讯搜索
+    try:
+        resp = http_session.get("http://smartbox.gtimg.cn/s3/", params={"v":2,"q":keyword,"t":"all"}, timeout=3)
+        resp.encoding = 'GBK'
+        match = re.search(r'v_hint="(.*?)"', resp.text)
+        if match and match.group(1):
+            parts = match.group(1).split('^')[0].split(',')
+            if len(parts)>=2:
+                code_match = re.search(r'\d{6}', parts[0])
+                if code_match: return code_match.group(0), parts[1]
+    except: pass
+
     return None, None
 
-# ================== 双核 K 线引擎（东财+腾讯） ==================
+# ================== 三源K线引擎（东财+腾讯+新浪） ==================
 class StockAnalyzer:
     def __init__(self, symbol, name, cost_price=None):
         self.symbol, self.name = symbol, name
@@ -141,7 +173,7 @@ class StockAnalyzer:
         self.chip_peak = 0.0
 
     def fetch_data(self, end_date=None):
-        # 主源：东方财富
+        # 源1：东方财富
         mkt = "0" if self.symbol.startswith(("0","3")) else "1"
         url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
         params = {"secid": f"{mkt}.{self.symbol}",
@@ -158,37 +190,35 @@ class StockAnalyzer:
                 data = resp.json()
                 if data and data.get("data") and data["data"].get("klines"):
                     klines = data["data"]["klines"]
-                    if len(klines) < 20:
-                        raise Exception("数据不足")
-                    parsed = []
-                    for item in klines:
-                        p = item.split(",")
-                        parsed.append({
-                            "date": p[0],
-                            "open": float(p[1]),
-                            "close": float(p[2]),
-                            "high": float(p[3]),
-                            "low": float(p[4]),
-                            "volume": float(p[5]),
-                            "turnover": float(p[10])
-                        })
-                    self.df = pd.DataFrame(parsed)
-                    return True
+                    if len(klines) >= 10:
+                        parsed = []
+                        for item in klines:
+                            p = item.split(",")
+                            parsed.append({
+                                "date": p[0],
+                                "open": float(p[1]),
+                                "close": float(p[2]),
+                                "high": float(p[3]),
+                                "low": float(p[4]),
+                                "volume": float(p[5]),
+                                "turnover": float(p[10])
+                            })
+                        self.df = pd.DataFrame(parsed)
+                        print(f"✅ 东财数据 OK ({len(self.df)}条)")
+                        return True
         except Exception as e:
             print(f"东财K线 {self.symbol} 失败: {e}")
 
-        # 备用源：腾讯 (仅日线)
+        # 源2：腾讯
         prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
         tx_url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{self.symbol},day,,,{KLINE_LIMIT},qfq"
         try:
             resp = http_session.get(tx_url, timeout=5)
             data = resp.json()
             if data and data.get("code") == 0:
-                kline = None
                 stock_data = data["data"].get(f"{prefix}{self.symbol}")
-                if stock_data:
-                    kline = stock_data.get("qfqday") or stock_data.get("day")
-                if kline and len(kline) >= 20:
+                kline = stock_data.get("qfqday") or stock_data.get("day")
+                if kline and len(kline) >= 10:
                     parsed = [{
                         "date": i[0],
                         "open": float(i[1]),
@@ -199,14 +229,41 @@ class StockAnalyzer:
                         "turnover": 0.0
                     } for i in kline]
                     self.df = pd.DataFrame(parsed)
+                    print(f"✅ 腾讯数据 OK ({len(self.df)}条)")
                     return True
         except Exception as e:
             print(f"腾讯K线 {self.symbol} 失败: {e}")
 
+        # 源3：新浪财经（终极兜底，无换手率）
+        sina_prefix = "sz" if self.symbol.startswith(("0","3")) else "sh"
+        # 新浪日线接口
+        sina_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sina_prefix}{self.symbol}&scale=240&ma=no&datalen={KLINE_LIMIT}"
+        try:
+            resp = http_session.get(sina_url, timeout=5)
+            if resp.status_code == 200:
+                raw = resp.json()
+                if isinstance(raw, list) and len(raw) >= 10:
+                    parsed = []
+                    for item in raw:
+                        parsed.append({
+                            "date": item["day"],
+                            "open": float(item["open"]),
+                            "close": float(item["close"]),
+                            "high": float(item["high"]),
+                            "low": float(item["low"]),
+                            "volume": float(item["volume"]),
+                            "turnover": 0.0   # 新浪不提供换手
+                        })
+                    self.df = pd.DataFrame(parsed)
+                    print(f"✅ 新浪数据 OK ({len(self.df)}条)")
+                    return True
+        except Exception as e:
+            print(f"新浪K线 {self.symbol} 失败: {e}")
+
         return False
 
     def calculate_indicators(self):
-        if self.df.empty or len(self.df) < 20: return False
+        if self.df.empty or len(self.df) < 10: return False
         df = self.df
         df['MA5'] = df['close'].rolling(5).mean()
         df['MA10'] = df['close'].rolling(10).mean()
@@ -345,7 +402,7 @@ def scan_stocks(strategy, top_n=10):
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(analyze_single_scan, s["code"], strategy, s["name"], s["sector"]): s for s in stocks}
         for f in as_completed(futures):
-            time.sleep(0.08)
+            time.sleep(0.08)  # 反爬间隔
             res = f.result()
             if res: results.append(res)
     results.sort(key=lambda x: x['score'], reverse=True)
@@ -390,7 +447,7 @@ def analyze():
     if not code: return jsonify({"error":"无法识别股票"})
     az = StockAnalyzer(code, name, d.get('cost'))
     if not az.fetch_data():
-        return jsonify({"error":"行情获取失败（已尝试东方财富和腾讯双源）"})
+        return jsonify({"error":"行情获取失败（已尝试东财/腾讯/新浪三源）"})
     rep = az.get_full_report()
     if "error" in rep: return jsonify(rep)
     return jsonify({"report":rep})
@@ -435,7 +492,7 @@ HTML = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PRO-QUANT V7.3 双核稳定版</title>
+    <title>PRO-QUANT V8.0 三源容灾版</title>
     <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.bootcdn.net/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
@@ -455,7 +512,7 @@ HTML = '''<!DOCTYPE html>
 </head>
 <body>
 <nav class="navbar navbar-dark bg-dark mb-3 border-bottom border-secondary">
-    <div class="container-fluid"><span class="navbar-brand fw-bold text-success">🛰️ PRO-QUANT V7.3</span></div>
+    <div class="container-fluid"><span class="navbar-brand fw-bold text-success">🛰️ PRO-QUANT V8.0 三源容灾引擎</span></div>
 </nav>
 
 <div class="container-fluid px-4">
@@ -616,6 +673,6 @@ HTML = '''<!DOCTYPE html>
 </html>'''
 
 if __name__ == '__main__':
-    print("✅ 双核K线引擎已就绪（东财+腾讯）")
+    print("✅ 三源K线引擎已就绪（东财+腾讯+新浪）")
     print("👉 访问: http://127.0.0.1:10000")
     app.run(host='0.0.0.0', port=10000)
