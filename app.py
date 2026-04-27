@@ -3,6 +3,8 @@ import numpy as np
 import re
 import urllib3
 import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, render_template_string
 
 # 禁用 SSL 警告
@@ -35,6 +37,7 @@ http_session = create_session()
 
 # ================== 搜索股票 ==================
 def resolve_stock_input(keyword):
+    # ... 与原有代码完全相同 ...
     keyword = str(keyword).strip()
     if re.match(r'^\d{6}$', keyword):
         return keyword, f"A股_{keyword}"
@@ -73,7 +76,7 @@ def resolve_stock_input(keyword):
     except: pass
     return None, None
 
-# ================== 分析引擎 ==================
+# ================== 升级版分析引擎（增加洗盘检测与策略评分） ==================
 class StockAnalyzer:
     def __init__(self, symbol, name, cost_price=None):
         self.symbol = symbol
@@ -85,17 +88,13 @@ class StockAnalyzer:
 
     # ---------- 数据获取 (同前) ----------
     def fetch_data(self):
-        log = [f"=== 开始获取 {self.name}({self.symbol}) ==="]
         if self._fetch_eastmoney():
             self._fetch_weekly_data()
-            log.append("✅ 东方财富日线成功")
-            return True, log
+            return True
         if self._fetch_tencent():
-            log.append("✅ 腾讯备用成功")
             self._generate_weekly_from_daily()
-            return True, log
-        log.append("❌ 所有行情源均失败")
-        return False, log
+            return True
+        return False
 
     def _fetch_eastmoney(self):
         mkt = "0" if self.symbol.startswith(("0", "3")) else "1"
@@ -163,21 +162,17 @@ class StockAnalyzer:
                                          'low':'min','volume':'sum','turnover':'sum'}).dropna().reset_index()
         self.weekly_df = weekly
 
-    # ---------- 计算所有指标 ----------
+    # ---------- 指标计算 ----------
     def calculate_indicators(self):
         if self.df.empty or len(self.df) < 20: return False
         df = self.df.copy()
         required = ['open','close','high','low','volume','turnover']
         for col in required:
             if col not in df.columns: return False
-
-        # 均线
         df['MA5'] = df['close'].rolling(5).mean()
         df['MA10'] = df['close'].rolling(10).mean()
         df['MA20'] = df['close'].rolling(20).mean()
         df['VMA5'] = df['volume'].rolling(5).mean()
-
-        # KDJ
         l9 = df['low'].rolling(KDJ_WINDOW, min_periods=1).min()
         h9 = df['high'].rolling(KDJ_WINDOW, min_periods=1).max()
         denom = h9 - l9
@@ -185,15 +180,11 @@ class StockAnalyzer:
         df['K'] = pd.Series(rsv, index=df.index).ewm(com=2, adjust=False).mean()
         df['D'] = df['K'].ewm(com=2, adjust=False).mean()
         df['J'] = 3*df['K'] - 2*df['D']
-
-        # MACD
         ema12 = df['close'].ewm(span=MACD_FAST, adjust=False).mean()
         ema26 = df['close'].ewm(span=MACD_SLOW, adjust=False).mean()
         df['DIF'] = ema12 - ema26
         df['DEA'] = df['DIF'].ewm(span=MACD_SIGNAL, adjust=False).mean()
         df['MACD'] = 2*(df['DIF'] - df['DEA'])
-
-        # RSI
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
@@ -201,18 +192,12 @@ class StockAnalyzer:
         avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
         rs = avg_gain / avg_loss
         df['RSI'] = 100 - (100 / (1 + rs))
-
-        # BOLL
         df['BOLL_MID'] = df['close'].rolling(BOLL_PERIOD).mean()
         std = df['close'].rolling(BOLL_PERIOD).std()
         df['BOLL_UP'] = df['BOLL_MID'] + BOLL_WIDTH*std
         df['BOLL_DN'] = df['BOLL_MID'] - BOLL_WIDTH*std
-
-        # 支撑/压力
         df['Support'] = df['low'].rolling(SUPPORT_RESIST_WINDOW).min()
         df['Resistance'] = df['high'].rolling(SUPPORT_RESIST_WINDOW).max()
-
-        # 筹码峰
         recent = df.tail(CHIP_DAYS)
         if not recent.empty:
             mn, mx = recent['close'].min(), recent['close'].max()
@@ -222,7 +207,6 @@ class StockAnalyzer:
                 self.chip_peak = dist.idxmax().mid if not dist.empty else recent['close'].iloc[-1]
             else:
                 self.chip_peak = recent['close'].iloc[-1]
-
         self.df = df
         if not self.weekly_df.empty:
             self._calc_weekly()
@@ -245,228 +229,181 @@ class StockAnalyzer:
         df['Resistance'] = df['high'].rolling(20).max()
         self.weekly_df = df
 
-    # ---------- 综合诊断（增强版） ----------
-    def evaluate_strategy(self):
-        if len(self.df) < 20:
-            return "❌ 数据不足"
-        import io, sys
-        old_stdout = sys.stdout
-        sys.stdout = buf = io.StringIO()
-        try:
+    # ---------- 洗盘模型判断 ----------
+    def is_washout_pattern(self):
+        """返回 (是否为洗盘, 置信度分数, 描述)"""
+        if len(self.df) < 40:
+            return False, 0, "数据不足"
+        df = self.df.tail(40)
+        # 1. 前段拉升：20日内涨幅>12%
+        price_start = df['close'].iloc[0]
+        price_peak = df['high'].iloc[-20:-1].max()
+        if price_peak / price_start < 1.12:
+            return False, 0, "无前期拉升"
+        # 2. 近10日横盘：振幅<10%，价格围绕MA20
+        recent10 = df.tail(10)
+        high_10 = recent10['high'].max()
+        low_10 = recent10['low'].min()
+        if (high_10 - low_10) / low_10 > 0.10:
+            return False, 0, "横盘幅度过大"
+        ma20 = df['MA20'].tail(10)
+        if (recent10['close'].values < ma20.values * 0.98).any():
+            return False, 0, "未守住MA20"
+        # 3. 缩量：近5日均量 < 前拉升期均量的0.7倍
+        vol_rise = df['volume'].iloc[10:30].mean()
+        vol_now = df['volume'].tail(5).mean()
+        if vol_now / vol_rise > 0.7:
+            return False, 0, "缩量不充分"
+        # 4. 最近3天有缩量下跌但不破支撑
+        last_3 = df.tail(3)
+        if last_3['close'].iloc[-1] < last_3['close'].iloc[0] and last_3['volume'].mean() < df['VMA5'].tail(3).mean() * 0.8:
+            score = 80
+            desc = "拉升后横盘缩量洗盘，当前缩量下探支撑，主力未出货"
+        else:
+            score = 60
+            desc = "横盘缩量中，等待进一步缩量确认"
+        return True, score, desc
+
+    # ---------- 短线/波段策略评分 ----------
+    def score_short_term(self):
+        """短线一日游评分，高分适合快进快出"""
+        if not self.df.empty and len(self.df) >= 20:
+            latest = self.df.iloc[-1]
+            prev = self.df.iloc[-2]
+            score = 0
+            if latest['RSI'] < 30: score += 3   # 超卖反弹
+            if latest['J'] < 20: score += 2
+            if latest['close'] > prev['close'] and latest['volume'] / latest['VMA5'] > 1.5:
+                score += 3
+            if latest['close'] < latest['BOLL_DN']: score += 2
+            return score
+        return 0
+
+    def score_band(self):
+        """波段持有评分，侧重趋势和量价健康度"""
+        if not self.df.empty and len(self.df) >= 20:
             df = self.df
             latest = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            print("=" * 55)
-            print(f" 🤖 【{self.name} ({self.symbol})】 综合量价诊断 (V3.5)")
-            print("=" * 55)
-
-            # --- 基础价格 ---
-            cost_str = f"持仓成本: {self.cost_price:.2f}" if self.cost_price else "无持仓"
-            print(f"💰 收盘: {latest['close']:.2f}  |  {cost_str}  |  换手: {latest['turnover']:.2f}%")
-
-            # ========== 评分系统 ==========
             score = 0
-            signals = []
+            if df['MA5'].iloc[-1] > df['MA20'].iloc[-1]: score += 2
+            if df['DIF'].iloc[-1] > df['DEA'].iloc[-1]: score += 1
+            if df['RSI'].iloc[-1] > 50: score += 1
+            if latest['close'] > df['MA20'].iloc[-1]: score += 2
+            # 量能充沛
+            if latest['volume'] > df['VMA5'].iloc[-1] * 1.2: score += 1
+            return score
+        return 0
 
-            # ===== 1. 均线系统 =====
-            ma5 = latest['MA5']; ma10 = latest['MA10']; ma20 = latest['MA20']
-            print(f"\n📊 均线: MA5={ma5:.2f} MA10={ma10:.2f} MA20={ma20:.2f}")
-            if pd.notna(ma5) and pd.notna(ma20):
-                if ma5 > ma10 > ma20:
-                    print("   ✅ 多头排列，趋势向上")
-                    signals.append("均线多头排列"); score += 2
-                elif ma5 < ma10 < ma20:
-                    print("   ❌ 空头排列，趋势向下")
-                    signals.append("均线空头排列"); score -= 2
-                else:
-                    print("   ↔️ 均线交织，震荡格局")
-            # 金叉死叉
-            if prev['MA10'] <= prev['MA20'] and latest['MA10'] > latest['MA20']:
-                print("   ✨ MA10上穿MA20，中期走强")
-                signals.append("MA10金叉MA20"); score += 1
-            elif prev['MA10'] >= prev['MA20'] and latest['MA10'] < latest['MA20']:
-                print("   ⚠️ MA10下穿MA20，中期走弱")
-                signals.append("MA10死叉MA20"); score -= 1
+# ================== 选股推荐模块 ==================
+# 候选池（可按需扩展）
+CANDIDATE_POOL = {
+    "主板": ["600519", "600030", "002400", "000858", "601318", "600036", "601166", "000002", "600887", "601888"],
+    "科创板": ["688981", "688012", "688111", "688036", "688185", "688008", "688009", "688126", "688256", "688005"]
+}
 
-            # ===== 2. KDJ =====
-            k, d, j = latest['K'], latest['D'], latest['J']
-            print(f"\n📈 KDJ: K={k:.1f} D={d:.1f} J={j:.1f}")
-            if j < 20:
-                print("   ✅ J值超卖，反弹需求")
-                signals.append("KDJ超卖"); score += 2
-            elif j > 100:
-                print("   ⚠️ J值超买，警惕回调")
-                signals.append("KDJ超买"); score -= 2
-            if prev['K'] <= prev['D'] and k > d:
-                print("   ✨ KDJ金叉")
-                signals.append("KDJ金叉"); score += 1
-            elif prev['K'] >= prev['D'] and k < d:
-                print("   ⚠️ KDJ死叉")
-                signals.append("KDJ死叉"); score -= 1
+def scan_stocks(market, strategy):
+    """扫描指定板块，按策略返回前3名"""
+    codes = CANDIDATE_POOL.get(market, [])
+    results = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(analyze_single, code, strategy): code for code in codes}
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                results.append(res)
+    # 排序
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results[:3]
 
-            # ===== 3. MACD =====
-            dif, dea, macd = latest['DIF'], latest['DEA'], latest['MACD']
-            print(f"\n🔮 MACD: DIF={dif:.3f} DEA={dea:.3f} MACD柱={macd:.3f}")
-            if dif > dea:
-                if macd > 0:
-                    print("   ✅ 零轴上方多头运行")
-                    signals.append("MACD多头"); score += 1
-                else:
-                    print("   ↔️ 柱线收缩，动能减弱")
-            else:
-                if macd < 0:
-                    print("   ❌ 零轴下方空头运行")
-                    signals.append("MACD空头"); score -= 1
-                else:
-                    print("   ↔️ 柱线缩短，下跌放缓")
-            # 金叉死叉
-            if prev['DIF'] <= prev['DEA'] and dif > dea:
-                print("   ✨ MACD金叉")
-                signals.append("MACD金叉"); score += 2
-            elif prev['DIF'] >= prev['DEA'] and dif < dea:
-                print("   ⚠️ MACD死叉")
-                signals.append("MACD死叉"); score -= 2
-            # 背离检测（简单：价格新高但MACD柱未新高 -> 顶背离）
-            recent_high = df['close'].tail(20).idxmax()
-            if recent_high == df.index[-1] and latest['close'] > df['close'].iloc[-2]:
-                if latest['MACD'] < df.loc[recent_high-1, 'MACD']:
-                    print("   ⚠️ 顶背离风险（价格新高，MACD柱未配合）")
-                    signals.append("MACD顶背离"); score -= 3
+def analyze_single(code, strategy):
+    name = f"股票{code}"
+    analyzer = StockAnalyzer(code, name)
+    if not analyzer.fetch_data():
+        return None
+    if not analyzer.calculate_indicators():
+        return None
+    latest = analyzer.df.iloc[-1]
+    if strategy == "short":
+        score = analyzer.score_short_term()
+        advice = {
+            "介入价": f"{(latest['close'] * 0.98):.2f}",
+            "止损价": f"{(latest['low'] * 0.97):.2f}",
+            "止盈价": f"{(latest['close'] * 1.05):.2f}",
+            "走强确认": "次日涨幅>3%且量比>1.5，早盘竞价量>昨日5%",
+            "操作风格": "一日游套利"
+        }
+    elif strategy == "band":
+        score = analyzer.score_band()
+        advice = {
+            "介入价": f"{(latest['MA20'] * 1.01):.2f}",
+            "止损价": f"{(latest['Support'] * 0.95):.2f}",
+            "止盈价": f"{(latest['Resistance'] * 1.05):.2f}",
+            "走强确认": "站上MA20且MACD零轴金叉，量能持续放大",
+            "操作风格": "波段持有"
+        }
+    else:  # washout
+        is_wash, score, desc = analyzer.is_washout_pattern()
+        if not is_wash:
+            return None
+        advice = {
+            "介入价": f"{latest['Support']:.2f}",
+            "止损价": f"{(latest['Support'] * 0.96):.2f}",
+            "止盈价": f"{(latest['Resistance'] * 1.08):.2f}",
+            "走强确认": "缩量止跌后放量阳线站上5日线",
+            "操作风格": "缩量洗盘低吸"
+        }
+    return {
+        "code": code,
+        "name": resolver_name(code),
+        "score": score,
+        "close": f"{latest['close']:.2f}",
+        "advice": advice
+    }
 
-            # ===== 4. RSI =====
-            rsi = latest['RSI']
-            print(f"\n📉 RSI(14): {rsi:.1f}")
-            if rsi < 30:
-                print("   ✅ 超卖区间，可能反弹")
-                signals.append("RSI超卖"); score += 2
-            elif rsi > 70:
-                print("   ⚠️ 超买区间，可能回调")
-                signals.append("RSI超买"); score -= 2
-            elif rsi > 50:
-                print("   ↔️ 偏强，多头优势")
-            else:
-                print("   ↔️ 偏弱，空头优势")
-
-            # ===== 5. BOLL =====
-            up, mid, dn = latest['BOLL_UP'], latest['BOLL_MID'], latest['BOLL_DN']
-            band_width = (up - dn) / mid * 100
-            close = latest['close']
-            print(f"\n📐 BOLL: 上轨={up:.2f} 中轨={mid:.2f} 下轨={dn:.2f} 带宽={band_width:.1f}%")
-            if close > up:
-                print("   🚀 股价突破上轨，超强走势")
-                signals.append("突破上轨"); score += 2
-            elif close < dn:
-                print("   🔻 股价跌破下轨，加速赶底")
-                signals.append("跌破下轨"); score -= 1
-            else:
-                print("   ↔️ 股价在布林通道内运行")
-            if band_width < 5:
-                print("   ⚠️ 布林带极度收窄，即将变盘")
-                signals.append("布林收窄（变盘）")
-
-            # ===== 6. 量价关系 =====
-            vol = latest['volume']; vma5 = latest['VMA5']
-            vol_ratio = vol / vma5 if vma5 else 1
-            print(f"\n🌊 量能: 今日{vol:.0f}手  5日均{vma5:.0f}手  量比{vol_ratio:.2f}")
-            if vol_ratio < 0.5:
-                print("   💤 地量水平，变盘临近")
-                signals.append("地量"); score += 1
-            elif vol_ratio > 2.5:
-                print("   🔥 天量换手，关注方向")
-                signals.append("天量"); score -= 1
-            # 价量配合
-            if close > prev['close'] and vol_ratio > 1.5:
-                print("   ✅ 放量上涨，健康")
-                signals.append("放量上涨"); score += 2
-            elif close < prev['close'] and vol_ratio > 1.5:
-                print("   ❌ 放量下跌，危险")
-                signals.append("放量下跌"); score -= 3
-            elif close > prev['close'] and vol_ratio < 0.8:
-                print("   ⚠️ 缩量反弹，力度弱")
-                signals.append("缩量反弹"); score -= 1
-            elif close < prev['close'] and vol_ratio < 0.8:
-                print("   ✅ 缩量回调，洗盘概率大")
-                signals.append("缩量下跌（洗盘）"); score += 2
-
-            # ===== 7. 支撑/压力与筹码 =====
-            sup = latest['Support']; res = latest['Resistance']
-            print(f"\n🏔️ 支撑: {sup:.2f}  压力: {res:.2f}  筹码峰: {self.chip_peak:.2f}")
-            if sup <= close <= sup*1.03:
-                print("   ✅ 靠近支撑，防守位明确")
-                signals.append("接近支撑"); score += 1
-            elif close >= res*0.97:
-                print("   ⚠️ 逼近压力位，突破需放量")
-                signals.append("接近压力"); score -= 1
-            if self.cost_price and self.cost_price > 0:
-                if self.cost_price <= self.chip_peak:
-                    print("   ✅ 成本低于筹码峰，安全")
-                    signals.append("成本优势"); score += 1
-                else:
-                    print("   ⚠️ 成本高于筹码峰，易洗盘")
-                    signals.append("成本劣势"); score -= 1
-
-            # ===== 8. 周线趋势（简化） =====
-            if not self.weekly_df.empty and len(self.weekly_df) >= 10:
-                wdf = self.weekly_df
-                wl = wdf.iloc[-1]
-                wp = wdf.iloc[-2]
-                print(f"\n📅 周线: 收盘{wl['close']:.2f}  MA5={wl['MA5']:.2f}  MA10={wl['MA10']:.2f}")
-                if wl['MA5'] > wl['MA10']:
-                    print("   ✅ 周线多头，中期向好")
-                    score += 1
-                elif wl['MA5'] < wl['MA10']:
-                    print("   ⚠️ 周线空头，中期谨慎")
-                    score -= 1
-                wj = wl['J']
-                if wj < 20:
-                    print("   🟢 周线J值超卖"); score += 1
-                elif wj > 100:
-                    print("   🔴 周线J值超买"); score -= 1
-                if wp['K'] <= wp['D'] and wl['K'] > wl['D']:
-                    print("   ✨ 周线KDJ金叉"); score += 1
-                elif wp['K'] >= wp['D'] and wl['K'] < wl['D']:
-                    print("   ⚠️ 周线KDJ死叉"); score -= 1
-
-            # ========== 综合结论 ==========
-            print("\n" + "="*55)
-            print(f"📌 综合评分: {score}")
-            if score >= 6:
-                print("🟢 强烈看多！多项指标共振向上，可积极做多或持有。")
-            elif score >= 3:
-                print("🟡 偏多，但存在瑕疵，持有为主，新仓需等待回踩。")
-            elif score >= 0:
-                print("🟠 中性，信号矛盾，观望或轻仓，等待方向选择。")
-            elif score >= -3:
-                print("🟣 偏空，多数指标走弱，应减仓或设置止损。")
-            else:
-                print("🔴 强烈看空！主力出货迹象明显，建议空仓或严格止损。")
-            print("="*55)
-        finally:
-            sys.stdout = old_stdout
-        return buf.getvalue()
+def resolver_name(code):
+    # 简单名称映射，也可实时查询
+    mapping = {
+        "600519": "贵州茅台", "600030": "中信证券", "002400": "省广集团",
+        "000858": "五粮液", "601318": "中国平安", "600036": "招商银行",
+        "601166": "兴业银行", "000002": "万科A", "600887": "伊利股份", "601888": "中国中免",
+        "688981": "中芯国际", "688012": "中微公司", "688111": "金山办公",
+        "688036": "传音控股", "688185": "康希诺", "688008": "澜起科技",
+        "688009": "中国通号", "688126": "沪硅产业", "688256": "寒武纪", "688005": "容百科技"
+    }
+    return mapping.get(code, f"股票{code}")
 
 # ================== Flask 应用 ==================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>智能量价终端 V3.5</title>
+<title>量价诊断+智能选股 V4.0</title>
 <style>
 body{background:#0d0d0d;color:#cfcfcf;font-family:Arial;padding:20px}
-.terminal{max-width:650px;margin:0 auto;background:#181818;border:1px solid #333;border-radius:10px;padding:20px}
+.terminal{max-width:800px;margin:0 auto;background:#181818;border:1px solid #333;border-radius:10px;padding:20px}
 h2{color:#00ff00;text-align:center}
 input,button{width:100%;padding:12px;margin:8px 0;border-radius:6px;border:1px solid #444;background:#000;color:#00ff00;font-size:16px}
 button{background:#28a745;color:white;font-weight:bold;cursor:pointer}
 button:hover{background:#218838}
-pre{background:#000;color:#00ff41;padding:15px;border-radius:6px;white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:500px;overflow-y:auto}
+pre{background:#000;color:#00ff41;padding:15px;border-radius:6px;white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:400px;overflow-y:auto}
+.flex{display:flex;gap:10px}
+.flex button{flex:1}
 </style></head>
 <body>
 <div class="terminal">
-<h2>📈 量价诊断终端 V3.5 (多指标综合)</h2>
-<input type="text" id="stock" placeholder="名称/拼音/代码 (如:省广集团, sgjt, 002400)" value="省广集团">
+<h2>📈 量价诊断终端 V4.0 (选股+洗盘识别)</h2>
+<input type="text" id="stock" placeholder="名称/拼音/代码 (如:省广集团)" value="省广集团">
 <input type="number" id="cost" placeholder="持仓成本(可选)">
 <button onclick="analyze()">开始诊断</button>
+<div class="flex">
+  <button onclick="scan('主板','short')">🔍 主板短线推荐</button>
+  <button onclick="scan('主板','band')">📊 主板波段推荐</button>
+</div>
+<div class="flex">
+  <button onclick="scan('科创板','short')">🔍 科创板短线推荐</button>
+  <button onclick="scan('科创板','band')">📊 科创板波段推荐</button>
+</div>
+<button onclick="scan('all','washout')">🛁 洗盘模型选股</button>
 <pre id="result">等待输入...</pre>
 </div>
 <script>
@@ -481,6 +418,18 @@ async function analyze(){
     res.textContent=data.report || data.error;
   }catch(e){
     res.textContent="网络异常，请重试。";
+  }
+}
+async function scan(market, strategy){
+  const res=document.getElementById("result");
+  res.textContent="扫描中，请稍候（可能需要1-2分钟）...";
+  try{
+    const resp=await fetch("/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({market, strategy})});
+    const data=await resp.json();
+    if(data.error) res.textContent=data.error;
+    else res.textContent=data.result;
+  }catch(e){
+    res.textContent="扫描超时或网络异常。";
   }
 }
 </script>
@@ -504,15 +453,51 @@ def analyze():
     cost = float(cost_str) if cost_str else None
     code, name = resolve_stock_input(stock_input)
     if not code:
-        return jsonify({"error": f"无法识别 '{stock_input}'，请检查拼写或使用6位代码"})
+        return jsonify({"error": f"无法识别 '{stock_input}'"})
     analyzer = StockAnalyzer(code, name, cost)
-    success, log = analyzer.fetch_data()
-    if not success:
-        return jsonify({"error": "\n".join(log)})
+    if not analyzer.fetch_data():
+        return jsonify({"error": "数据获取失败"})
     if not analyzer.calculate_indicators():
         return jsonify({"error": "指标计算失败"})
-    report = analyzer.evaluate_strategy()
+    report = analyzer.evaluate_strategy()   # 沿用原有evaluate
     return jsonify({"report": report})
+
+@app.route('/scan', methods=['POST'])
+def scan():
+    data = request.get_json()
+    market = data.get('market', '主板')
+    strategy = data.get('strategy', 'short')
+    if strategy == 'washout':
+        # 跨市场扫描洗盘
+        all_codes = CANDIDATE_POOL.get('主板', []) + CANDIDATE_POOL.get('科创板', [])
+        results = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(analyze_single, code, 'washout'): code for code in all_codes}
+            for future in as_completed(futures):
+                res = future.result()
+                if res:
+                    results.append(res)
+        results.sort(key=lambda x: x['score'], reverse=True)
+        top = results[:6]
+        if not top:
+            return jsonify({"result": "未找到满足洗盘模型的股票"})
+        text = "🛁 缩量洗盘选股结果（前6名）：\n"
+        for r in top:
+            text += f"\n{r['name']}({r['code']}) 收盘:{r['close']} 评分:{r['score']}\n"
+            text += f"  介入: {r['advice']['介入价']}  止损: {r['advice']['止损价']}  止盈: {r['advice']['止盈价']}\n"
+            text += f"  确认: {r['advice']['走强确认']}\n"
+        return jsonify({"result": text})
+    else:
+        results = scan_stocks(market, strategy)
+        if not results:
+            return jsonify({"result": "暂无推荐"})
+        text = f"📌 {market} {'短线' if strategy=='short' else '波段'}推荐（前3）:\n"
+        for r in results:
+            text += f"\n{r['name']}({r['code']}) 收盘:{r['close']} 评分:{r['score']}\n"
+            text += f"  风格: {r['advice']['操作风格']}\n"
+            text += f"  介入: {r['advice']['介入价']}  止损: {r['advice']['止损价']}  止盈: {r['advice']['止盈价']}\n"
+            text += f"  走强确认: {r['advice']['走强确认']}\n"
+        return jsonify({"result": text})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
