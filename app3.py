@@ -1,65 +1,76 @@
-import pandas as pd
-import numpy as np
-import re
-import urllib3
-import requests
-import time
-import random
+# -*- coding: utf-8 -*-
+import logging
 import math
+import random
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, request, jsonify, render_template_string
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+import urllib3
+from flask import Flask, jsonify, render_template_string, request
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ================== 常量与网络配置 ==================
-KLINE_LIMIT = 300 
+# ================== 基本配置 ==================
+KLINE_LIMIT = 400
+ACTIVE_CACHE_TTL = 30 * 60
+MARKET_CACHE_TTL = 10 * 60
+MAX_WORKERS = 30
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
 ]
 
-def create_session():
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ================== 网络会话 ==================
+def create_session() -> requests.Session:
     session = requests.Session()
-    retry = urllib3.util.retry.Retry(total=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = requests.adapters.HTTPAdapter(max_retries=retry, pool_connections=150, pool_maxsize=150)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
+    retry = Retry(total=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
     session.verify = False
     return session
 
-http_session = create_session()
-active_cache = {"data": None, "time": 0}
+HTTP = create_session()
 
-# ================== 基础工具函数 ==================
-def safe_float(val, default=0.0):
+# ================== 工具函数 ==================
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        v = float(val)
+        v = float(value)
         return default if math.isnan(v) or math.isinf(v) else v
     except: return default
 
-def safe_date(date_str):
-    date_str = str(date_str).strip()
-    if len(date_str) == 8 and date_str.isdigit():
-        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-    return date_str.replace("/", "-")
-
-def resolve_stock_input(keyword):
-    keyword = str(keyword).strip()
-    if re.match(r'^\d{6}$', keyword): return keyword, f"A股_{keyword}"
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        resp = http_session.get("https://searchapi.eastmoney.com/api/suggest/get", params={
-            "input":keyword,"type":"14","token":"D43BF722C8E33BDC906FB84D85E326E8","count":"1"}, timeout=3)
-        if resp.status_code==200 and resp.json().get("QuotationCodeTable", {}).get("Data"):
-            item = resp.json()["QuotationCodeTable"]["Data"][0]
-            return item["Code"], item["Name"]
-    except: pass
-    return keyword, keyword 
+        return int(float(value))
+    except: return default
 
-def get_active_stocks(limit=400):
+def safe_date(value: Any) -> str:
+    text = str(value).strip().replace("/", "-")
+    if len(text) == 8 and text.isdigit(): return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
+
+def market_id_from_code(code: str) -> str:
+    return "1" if str(code).startswith(("5", "6", "9")) else "0"
+
+# ================== 活跃股票池 ==================
+active_cache = {"data": None, "time": 0.0}
+
+def get_active_stocks(limit: int = 400) -> List[Dict[str, Any]]:
     global active_cache
     now = time.time()
-    if active_cache["data"] is not None and (now - active_cache["time"]) < 1800:
+    if active_cache["data"] is not None and (now - active_cache["time"]) < ACTIVE_CACHE_TTL:
         return active_cache["data"][:limit]
 
     stocks = []
@@ -68,16 +79,20 @@ def get_active_stocks(limit=400):
         params = {
             "pn": "1", "pz": str(max(limit, 800)), "po": "1", "np": "1",
             "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
-            "fid": "f20", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-            "fields": "f12,f14,f10,f20,f100", "_": str(int(now*1000))
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23", "fields": "f12,f14,f100", "fid": "f3",
+            "_": str(int(now * 1000))
         }
-        resp = http_session.get(url, params=params, timeout=4).json()
-        if resp and resp.get("data") and resp["data"].get("diff"):
-            for item in resp["data"]["diff"]:
-                code, name = item.get("f12"), item.get("f14")
-                if not code or "ST" in name or "退" in name: continue
-                stocks.append({"code": code, "name": name, "volume_ratio": item.get("f20", 1), "sector": item.get("f100", "")})
+        resp = HTTP.get(url, params=params, timeout=4)
+        if resp.status_code == 200:
+            diff = resp.json().get("data", {}).get("diff", [])
+            for item in diff:
+                code, name = item.get("f12", ""), item.get("f14", "")
+                if not re.fullmatch(r"\d{6}", code) or not name or "ST" in name.upper() or "退" in name: continue
+                stocks.append({"code": code, "name": name, "sector": item.get("f100", "未分类")})
     except: pass
+
+    if not stocks: # 兜底
+        stocks = [{"code":"600519","name":"贵州茅台","sector":"白酒"}]
         
     unique_stocks = list({s['code']: s for s in stocks}.values())
     random.shuffle(unique_stocks)
@@ -85,104 +100,83 @@ def get_active_stocks(limit=400):
     active_cache["time"] = now
     return unique_stocks[:limit]
 
-# ================== 大盘情绪与全局风控 ==================
+def resolve_stock_input(keyword: str) -> Tuple[Optional[str], str]:
+    text = str(keyword).strip()
+    if re.fullmatch(r"\d{6}", text): return text, text
+    try:
+        resp = HTTP.get("https://searchapi.eastmoney.com/api/suggest/get", params={"input": text, "type": "14", "token": "D43BF722C8E33BDC906FB84D85E326E8", "count": "1"}, timeout=3)
+        if resp.status_code == 200 and resp.json().get("QuotationCodeTable", {}).get("Data"):
+            item = resp.json()["QuotationCodeTable"]["Data"][0]
+            return item["Code"], item["Name"]
+    except: pass
+    return text, text
+
+# ================== 核心：市场气候与情绪风向标 ==================
 class MarketClimateAnalyzer:
-    def __init__(self):
-        self.df = pd.DataFrame()
-        
-    def fetch_index_data(self):
+    def get_climate_report(self):
         url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
         params = {"secid": "1.000001", "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61", "klt": "101", "fqt": "1", "end": "20500101", "lmt": "60"}
         try:
-            resp = http_session.get(url, params=params, timeout=4)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data and data.get("data") and data["data"].get("klines"):
-                    klines = data["data"]["klines"]
-                    self.df = pd.DataFrame([{"date": p.split(",")[0], "close": safe_float(p.split(",")[2]), "high": safe_float(p.split(",")[3]), "low": safe_float(p.split(",")[4]), "volume": safe_float(p.split(",")[5]), "amount": safe_float(p.split(",")[6])} for p in klines])
-                    return True
+            resp = HTTP.get(url, params=params, timeout=4)
+            if resp.status_code == 200 and resp.json().get("data"):
+                klines = resp.json()["data"]["klines"]
+                df = pd.DataFrame([{"close": safe_float(p.split(",")[2]), "high": safe_float(p.split(",")[3]), "low": safe_float(p.split(",")[4]), "volume": safe_float(p.split(",")[5]), "amount": safe_float(p.split(",")[6])} for p in klines])
+                
+                df['MA20'] = df['close'].rolling(20).mean()
+                l9, h9 = df['low'].rolling(9).min(), df['high'].rolling(9).max()
+                rsv = np.where((h9 - l9)==0, 50, (df['close']-l9)/(h9 - l9)*100)
+                df['K'] = pd.Series(rsv, index=df.index).ewm(com=2).mean()
+                df['D'] = df['K'].ewm(com=2).mean()
+                df['J'] = 3*df['K'] - 2*df['D']
+                
+                latest, prev = df.iloc[-1], df.iloc[-2]
+                is_uptrend = latest['close'] > latest['MA20']
+                j_val = latest['J']
+                est_amount = (latest['amount'] / 0.4) / 100000000 
+                news_sentiment = "🔥 活跃 (资金充沛)" if est_amount > 10000 else ("🧊 萎靡 (存量博弈)" if est_amount < 6000 else "⚖️ 中性 (板块轮动)")
+
+                if is_uptrend and 20 <= j_val <= 80: status, color, pos, adv = "🟢 温和做多区", "success", "7成~满仓", "大盘量价齐升，趋势向上，可重仓参与主线龙头或回踩低吸。"
+                elif is_uptrend and j_val > 90: status, color, pos, adv = "🔥 情绪高潮区", "warning", "5成", "指数加速赶顶，短线情绪极度亢奋，提防盛极而衰，切忌追高。"
+                elif not is_uptrend and j_val < 15: status, color, pos, adv = "🧊 极度恐慌区", "info", "3成", "市场非理性错杀，J值触底，左侧资金可小仓位尝试抄底错杀龙头。"
+                elif not is_uptrend: status, color, pos, adv = "🔴 阴跌绞肉机", "danger", "空仓或1成", "大盘破位，系统性风险极大，主力离场，建议空仓休息！"
+                else: status, color, pos, adv = "🟡 混沌震荡区", "secondary", "3成~5成", "多空激烈博弈，盘面热点散乱。高抛低吸，不格局，控仓位。"
+                
+                return {"status": status, "color": color, "position": pos, "advice": adv, "index_price": f"{latest['close']:.2f}", "change": f"{(latest['close']-prev['close'])/prev['close']*100:+.2f}%", "j_val": f"{j_val:.1f}", "news_sentiment": news_sentiment, "amount": f"{est_amount:.0f}亿"}
         except: pass
-        return False
-        
-    def get_climate_report(self):
-        if not self.fetch_index_data() or self.df.empty:
-            return {"status": "未知", "color": "secondary", "advice": "数据获取异常", "position": "3成", "index_price": "0.00", "news_sentiment": "中性"}
-        
-        df = self.df
-        df['MA20'] = df['close'].rolling(20).mean()
-        df['VMA5'] = df['volume'].rolling(5).mean()
-        l9, h9 = df['low'].rolling(9).min(), df['high'].rolling(9).max()
-        rsv = np.where((h9 - l9)==0, 50, (df['close']-l9)/(h9 - l9)*100)
-        df['K'] = pd.Series(rsv, index=df.index).ewm(com=2).mean()
-        df['D'] = df['K'].ewm(com=2).mean()
-        df['J'] = 3*df['K'] - 2*df['D']
-        
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        is_uptrend = latest['close'] > latest['MA20']
-        is_vol_active = latest['volume'] > latest['VMA5']
-        j_val = latest['J']
-        change_pct = (latest['close'] - prev['close']) / prev['close'] * 100
-        
-        # 预估两市成交额情绪 (假设上证占全市场约40%)
-        est_total_amount = (latest['amount'] / 0.4) / 100000000 # 亿元
-        news_sentiment = "🔥 活跃 (资金充沛)" if est_total_amount > 10000 else ("🧊 萎靡 (存量博弈)" if est_total_amount < 6000 else "⚖️ 中性 (板块轮动)")
+        return {"status": "未知", "color": "secondary", "advice": "数据获取异常", "position": "--", "index_price": "0.00", "news_sentiment": "未知"}
 
-        if is_uptrend and is_vol_active and 20 <= j_val <= 80:
-            status, color, pos, adv = "🟢 温和做多区", "success", "7成~满仓", "大盘量价齐升，趋势向上，可重仓参与主线龙头或回踩低吸。"
-        elif is_uptrend and j_val > 90:
-            status, color, pos, adv = "🔥 情绪高潮区", "warning", "5成", "指数加速赶顶，短线情绪极度亢奋，提防盛极而衰，切忌追高。"
-        elif not is_uptrend and j_val < 15:
-            status, color, pos, adv = "🧊 极度恐慌区", "info", "3成", "市场非理性错杀，J值触底，左侧资金可小仓位尝试抄底错杀龙头。"
-        elif not is_uptrend and not is_vol_active:
-            status, color, pos, adv = "🔴 阴跌绞肉机", "danger", "空仓或1成", "大盘破位且缩量，系统性风险极大，主力离场，建议空仓休息！"
-        else:
-            status, color, pos, adv = "🟡 混沌震荡区", "secondary", "3成~5成", "多空激烈博弈，盘面热点散乱。高抛低吸，不格局，控仓位。"
-            
-        return {
-            "status": status, "color": color, "position": pos, "advice": adv,
-            "index_price": f"{latest['close']:.2f}", "change": f"{change_pct:+.2f}%",
-            "j_val": f"{j_val:.1f}", "news_sentiment": news_sentiment, "amount": f"{est_total_amount:.0f}亿"
-        }
+def fetch_real_sentiment(code: str) -> Dict:
+    """真实东财股吧人气接口提取"""
+    try:
+        mkt = market_id_from_code(code)
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {"secid": f"{mkt}.{code}", "fields": "f136,f137,f139"}
+        resp = HTTP.get(url, params=params, timeout=3)
+        if resp.status_code == 200:
+            d = resp.json().get("data", {})
+            return {"rank": safe_int(d.get("f136")), "hot": safe_int(d.get("f137")), "posts": safe_int(d.get("f139"))}
+    except: pass
+    return {}
 
-# ================== 个股分析引擎 ==================
+# ================== 个股研判引擎 ==================
 class StockAnalyzer:
     def __init__(self, symbol, name):
         self.symbol = symbol
         self.name = name
         self.df = pd.DataFrame()
+        self.sentiment = {}
 
-    def fetch_data(self, start_date=None, end_date=None):
-        mkt = "0" if self.symbol.startswith(("0","3")) else "1"
+    def fetch_data(self):
+        mkt = market_id_from_code(self.symbol)
         url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "secid": f"{mkt}.{self.symbol}",
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": "101", "fqt": "1", "end": "20500101", "lmt": str(KLINE_LIMIT)
-        }
+        params = {"secid": f"{mkt}.{self.symbol}", "fields1": "f1,f2,f3,f4,f5,f6", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61", "klt": "101", "fqt": "1", "end": "20500101", "lmt": str(KLINE_LIMIT)}
         try:
-            resp = http_session.get(url, params=params, timeout=4)
+            resp = HTTP.get(url, params=params, timeout=4)
             if resp.status_code == 200 and resp.json().get("data"):
                 klines = resp.json()["data"]["klines"]
-                parsed = []
-                for item in klines:
-                    p = item.split(",")
-                    parsed.append({
-                        "date": safe_date(p[0]), "open": safe_float(p[1]), "close": safe_float(p[2]),
-                        "high": safe_float(p[3]), "low": safe_float(p[4]), "volume": safe_float(p[5]),
-                        "amount": safe_float(p[6]), "turnover": safe_float(p[10])
-                    })
-                df = pd.DataFrame(parsed)
-                df['date'] = pd.to_datetime(df['date'])
-                
-                # 时间截取过滤
-                if start_date: df = df[df['date'] >= pd.to_datetime(start_date)]
-                if end_date: df = df[df['date'] <= pd.to_datetime(end_date)]
-                
-                self.df = df.reset_index(drop=True)
-                return len(self.df) >= 20
+                self.df = pd.DataFrame([{"date": safe_date(p.split(",")[0]), "open": safe_float(p.split(",")[1]), "close": safe_float(p.split(",")[2]), "high": safe_float(p.split(",")[3]), "low": safe_float(p.split(",")[4]), "volume": safe_float(p.split(",")[5])} for p in klines])
+                self.sentiment = fetch_real_sentiment(self.symbol)
+                return len(self.df) >= 30
         except: pass
         return False
 
@@ -192,159 +186,118 @@ class StockAnalyzer:
         df['MA10'] = df['close'].rolling(10).mean()
         df['MA20'] = df['close'].rolling(20).mean()
         df['VMA5'] = df['volume'].rolling(5).mean()
+        df['VMA20'] = df['volume'].rolling(20).mean()
         
+        # KDJ
         l9, h9 = df['low'].rolling(9).min(), df['high'].rolling(9).max()
-        denom = h9 - l9
-        rsv = np.where(denom==0, 50, (df['close']-l9)/denom*100)
+        rsv = np.where((h9 - l9)==0, 50, (df['close']-l9)/(h9 - l9)*100)
         df['K'] = pd.Series(rsv, index=df.index).ewm(com=2).mean()
         df['D'] = df['K'].ewm(com=2).mean()
         df['J'] = 3*df['K'] - 2*df['D']
         self.df = df.fillna(0)
 
-    # 次日盘中操作剧本推演
-    def generate_intraday_advice(self):
+    def get_sentiment_state(self):
+        """融合量价 RFI 与真实人气排名的高阶情感分析"""
         latest = self.df.iloc[-1]
-        prev = self.df.iloc[-2]
-        vol_ratio = latest['volume'] / (latest['VMA5'] + 1)
+        recent = self.df.tail(10)
+        volatility = (recent["high"].max() - recent["low"].min()) / (recent["low"].min()+0.01)
+        rfi_proxy = min(100, (recent["volume"].mean() / (self.df["volume"].mean()+1)) * volatility * 100)
         
-        # 测算爆量标准 (昨天成交量的特定比例)
-        auction_vol_strong = latest['volume'] * 0.08  # 竞价量达昨日8%为爆量弱转强
-        auction_vol_weak = latest['volume'] * 0.02    # 竞价量不足昨日2%为无量
+        # 真假情绪融合逻辑
+        rank = self.sentiment.get("rank", 9999)
+        if 0 < rank <= 100: rfi_proxy = max(rfi_proxy, 90) # 真龙头霸榜
         
-        script = f"🎯 【次日竞价与盘中剧本推演】\n"
-        script += f"➤ 强力做多剧本 (弱转强)：早盘9:25竞价成交量若达到 {auction_vol_strong/10000:.1f}万手以上，且竞价涨幅在 +1.5% ~ +4.0% 之间，说明主力资金抢筹，果断跟随。\n"
-        script += f"➤ 诱多防守剧本 (强转弱)：若开盘直接秒板或高开 > 6% 但竞价成交量不足 {auction_vol_weak/10000:.1f}万手，极易被砸成诱多长上影，持股者逢高兑现，空仓者切忌打板。\n"
-        script += f"➤ 盘中洗盘剧本：若平开或小幅低开回踩 {latest['MA5']:.2f} (MA5均线) 附近，分时图呈现'缩量下杀、放量拉回'，是绝佳的盘中低吸点。\n"
+        stage = "🧊 冰点/酝酿期 (无人问津)"
+        if rfi_proxy > 80 and latest['close'] < latest['MA5']: stage = "⚔️ 分歧/衰退期 (多空互道傻X)"
+        elif rfi_proxy > 75 and latest['close'] > latest['MA5']: stage = "🔥 高潮/加速期 (全网沸腾)"
+        elif rfi_proxy < 30 and latest['volume'] > self.df.iloc[-2]['volume'] * 1.5: stage = "🌱 发酵/启动期 (先知先觉)"
+        return round(rfi_proxy, 1), stage
+
+    def analyze_strategy(self):
+        ctx = self.df.iloc[-1]
+        df30 = self.df.tail(30)
         
+        # 1. 龙回头
+        peak_idx = df30["high"].idxmax()
+        peak_price = df30.loc[peak_idx]["high"]
+        drawdown = (peak_price - ctx["close"]) / (peak_price + 0.01)
+        is_dragon = (peak_price / (df30.iloc[0]["close"] + 0.01) > 1.35) and (0.15 <= drawdown <= 0.35) and (ctx["volume"] < df30.loc[peak_idx]["volume"] * 0.45) and (ctx["close"] >= ctx["MA20"])
+        
+        # 2. 洗盘
+        is_wash = (df30["high"].max() / (df30["close"].iloc[0]+0.01) > 1.05) and (0.05 <= drawdown <= 0.15) and (ctx["volume"] < ctx["VMA20"] * 0.8)
+        
+        # 3. 短线突击
+        is_short = ctx["J"] < 35 and ctx["close"] > self.df.iloc[-2]["close"] and ctx["volume"] > ctx["VMA5"] * 1.2
+        
+        return "dragon_wave" if is_dragon else ("washout" if is_wash else ("short" if is_short else "none"))
+
+    # 生成盘中剧本
+    def generate_playbook(self):
+        latest = self.df.iloc[-1]
+        auction_vol = latest['volume'] * 0.08
+        script = f"🎯 【次日操盘剧本推演】\n"
+        script += f"➤ 弱转强点火：早盘9:25竞价量若超 {auction_vol/10000:.1f}万手 且涨幅 +1.5%~4%，游资抢筹特征明显，可半路跟随。\n"
+        script += f"➤ 盘中洗盘低吸：若平开回踩 {latest['MA5']:.2f} (MA5) 附近，分时呈现'缩量下杀、放量拉回'，为日内绝佳低吸点。\n"
+        script += f"➤ 强转弱诱多：若直接高开 >6% 但竞价无量，极易被砸成诱多长上影，持股者逢高兑现，切忌打板。\n"
         return script
 
-# ================== AI 多维度回测引擎 ==================
-def backtest_strategy(df, buy_idx):
-    """平行运行5套退出策略，返回各策略的收益"""
-    buy_price = df['open'].iloc[buy_idx]
+# ================== 机器动态回测与组合模块 ==================
+def dynamic_backtest(df, buy_idx, hold_days=5):
+    """运用原V5版的先进Lambda评估思路进行实盘演练"""
+    buy_price = df.iloc[buy_idx]['open']
     if buy_price <= 0: return None
     
-    results = {
-        "fixed_5d": {"return": 0, "days": 0, "sell_reason": "固定5天"},
-        "ma5_break": {"return": 0, "days": 0, "sell_reason": "跌破MA5"},
-        "ma10_break": {"return": 0, "days": 0, "sell_reason": "跌破MA10"},
-        "trailing_15": {"return": 0, "days": 0, "sell_reason": "回撤15%止盈"},
-        "hybrid": {"return": 0, "days": 0, "sell_reason": "综合风控退场"}
+    rules = {
+        "fixed_5d": {"ret": 0, "days": 0, "name": "固定持仓5天"},
+        "ma5_break": {"ret": 0, "days": 0, "name": "破 MA5 出局"},
+        "ma10_break": {"ret": 0, "days": 0, "name": "破 MA10 出局"},
+        "trailing_15": {"ret": 0, "days": 0, "name": "最高回撤 15%"},
+        "hybrid": {"ret": 0, "days": 0, "name": "破MA5或回撤15%"}
     }
     
-    max_price_since_buy = buy_price
-    
-    # 模拟未来走势
-    for step in range(1, len(df) - buy_idx):
-        curr_idx = buy_idx + step
-        curr_row = df.iloc[curr_idx]
-        curr_close = curr_row['close']
-        curr_ma5 = curr_row['MA5']
-        curr_ma10 = curr_row['MA10']
+    max_p = buy_price
+    for i in range(1, len(df) - buy_idx):
+        row = df.iloc[buy_idx + i]
+        c, m5, m10 = row['close'], row['MA5'], row['MA10']
+        max_p = max(max_p, row['high'])
+        dd = (max_p - c) / max_p
         
-        max_price_since_buy = max(max_price_since_buy, curr_row['high'])
-        drawdown_from_peak = (max_price_since_buy - curr_close) / max_price_since_buy
-        
-        # 1. 跌破 MA5
-        if results["ma5_break"]["days"] == 0 and curr_close < curr_ma5:
-            results["ma5_break"] = {"return": curr_close/buy_price - 1, "days": step, "sell_reason": "跌破 MA5"}
+        if rules["ma5_break"]["days"] == 0 and c < m5: rules["ma5_break"].update({"ret": c/buy_price-1, "days": i})
+        if rules["ma10_break"]["days"] == 0 and c < m10: rules["ma10_break"].update({"ret": c/buy_price-1, "days": i})
+        if rules["trailing_15"]["days"] == 0 and (dd >= 0.15 or c < buy_price*0.85): rules["trailing_15"].update({"ret": c/buy_price-1, "days": i})
+        if rules["hybrid"]["days"] == 0 and (c < m5 or dd >= 0.15): rules["hybrid"].update({"ret": c/buy_price-1, "days": i})
+        if rules["fixed_5d"]["days"] == 0 and i == hold_days: rules["fixed_5d"].update({"ret": c/buy_price-1, "days": i})
             
-        # 2. 跌破 MA10
-        if results["ma10_break"]["days"] == 0 and curr_close < curr_ma10:
-            results["ma10_break"] = {"return": curr_close/buy_price - 1, "days": step, "sell_reason": "跌破 MA10"}
+    final_c = df.iloc[-1]['close']
+    final_d = len(df) - buy_idx - 1
+    for v in rules.values():
+        if v["days"] == 0: v.update({"ret": final_c/buy_price-1, "days": final_d})
             
-        # 3. 移动止盈/止损 15%
-        if results["trailing_15"]["days"] == 0 and (drawdown_from_peak >= 0.15 or curr_close < buy_price * 0.85):
-            results["trailing_15"] = {"return": curr_close/buy_price - 1, "days": step, "sell_reason": "触发15%风控线"}
-            
-        # 4. 混合策略 (跌破MA5 或 回撤15%)
-        if results["hybrid"]["days"] == 0 and (curr_close < curr_ma5 or drawdown_from_peak >= 0.15):
-            results["hybrid"] = {"return": curr_close/buy_price - 1, "days": step, "sell_reason": "复合破位"}
+    return rules
 
-        # 5. 固定5天
-        if step == 5 and results["fixed_5d"]["days"] == 0:
-            results["fixed_5d"] = {"return": curr_close/buy_price - 1, "days": step, "sell_reason": "固定 5 天"}
-            
-    # 收尾处理：如果一直没触发，按最后一天收盘价计算
-    final_close = df.iloc[-1]['close']
-    final_step = len(df) - buy_idx - 1
-    for k, v in results.items():
-        if v["days"] == 0:
-            results[k] = {"return": final_close/buy_price - 1, "days": final_step, "sell_reason": "持有至今"}
-            
-    return results
+def run_strategy_scan(strategy: str, top_n: int = 12):
+    universe = get_active_stocks(400)
+    results = []
+    
+    def _scan(s):
+        az = StockAnalyzer(s['code'], s['name'])
+        if az.fetch_data() and az.calc_indicators():
+            st = az.analyze_strategy()
+            if st == strategy:
+                latest = az.df.iloc[-1]
+                rfi, _ = az.get_sentiment_state()
+                return {"code": s['code'], "name": s['name'], "price": latest['close'], "rfi": rfi, "advice": f"{latest['close']*0.99:.2f} 附近"}
+        return None
 
-def run_advanced_backtest(code, name, start_date):
-    az = StockAnalyzer(code, name)
-    # 获取从 start_date 至今的数据
-    if not az.fetch_data(start_date=start_date) or not az.calc_indicators():
-        return {"error": "获取历史数据失败或数据不足"}
-        
-    df = az.df
-    signals = []
-    
-    # 模拟寻找买点信号 (以缩量回踩/龙回头为例)
-    for i in range(30, len(df) - 5): # 留出未来几天计算收益
-        row = df.iloc[i]
-        prev = df.iloc[i-1]
-        
-        # 买点逻辑：MA20之上，近期缩量，J值处于低位超卖
-        if row['close'] > row['MA20'] and row['volume'] < row['VMA5'] * 0.8 and row['J'] < 30:
-            # 找到买点，传入明天开盘的 index 进行回测
-            sim_res = backtest_strategy(df, i + 1)
-            if sim_res:
-                signals.append(sim_res)
-                
-    if not signals:
-        return {"error": f"该区间内 ({start_date} 至今) 未触发符合模型的入场信号。"}
-        
-    # 聚合汇总各策略表现
-    strategy_metrics = {}
-    for st_name in ["fixed_5d", "ma5_break", "ma10_break", "trailing_15", "hybrid"]:
-        rets = [s[st_name]["return"] for s in signals]
-        days = [s[st_name]["days"] for s in signals]
-        win_rate = sum(1 for r in rets if r > 0) / len(rets) * 100
-        avg_ret = sum(rets) / len(rets) * 100
-        avg_days = sum(days) / len(days)
-        
-        # 核心：计算策略的期望得分 (盈亏比加权)
-        expected_value = win_rate * avg_ret 
-        
-        strategy_metrics[st_name] = {
-            "name": st_name,
-            "win_rate": win_rate,
-            "avg_ret": avg_ret,
-            "avg_days": avg_days,
-            "score": expected_value
-        }
-        
-    # 排序评优
-    sorted_st = sorted(strategy_metrics.values(), key=lambda x: x["score"], reverse=True)
-    medals = ["🥇", "🥈", "🥉", "4", "5"]
-    
-    report_text = f"📅 【{name} ({code})】动态优化回测报告\n"
-    report_text += f"测算区间：{start_date} 至今  |  共触发真实买点信号：{len(signals)} 次\n"
-    report_text += "=" * 60 + "\n"
-    report_text += f"{'排名':<4} | {'策略类型':<14} | {'平均收益':<8} | {'胜率':<8} | {'平均持仓'}\n"
-    report_text += "-" * 60 + "\n"
-    
-    st_mapping = {
-        "fixed_5d": "固定持仓 5天", "ma5_break": "跌破 MA5 止盈损",
-        "ma10_break": "跌破 MA10 止盈损", "trailing_15": "极值回撤 15%", "hybrid": "破MA5或回撤15%"
-    }
-    
-    for idx, st in enumerate(sorted_st):
-        s_name = st_mapping[st['name']]
-        report_text += f"{medals[idx]:<4} | {s_name:<12} | {st['avg_ret']:>6.2f}% | {st['win_rate']:>5.1f}% | {st['avg_days']:>4.1f} 天\n"
-        
-    report_text += "=" * 60 + "\n"
-    report_text += f"💡 机器深度优化结论：\n"
-    report_text += f"针对【{name}】的股性，历史数据表明采用【{st_mapping[sorted_st[0]['name']]}】的退出机制能够获得最高的资金期望效率。\n"
-    report_text += f"建议在实战中严格执行此纪律，克服主观情绪波动。"
-    
-    return {"report": report_text}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(_scan, s): s for s in universe}
+        for f in as_completed(futures):
+            res = f.result()
+            if res: results.append(res)
+            
+    return sorted(results, key=lambda x: x['rfi'], reverse=True)[:top_n]
 
-# ================== Flask 后端路由 ==================
+# ================== Flask 路由 ==================
 app = Flask(__name__)
 
 @app.route('/')
@@ -352,63 +305,104 @@ def home(): return render_template_string(HTML)
 
 @app.route('/climate', methods=['GET'])
 def get_climate():
-    report = MarketClimateAnalyzer().get_climate_report()
-    return jsonify(report)
+    return jsonify(MarketClimateAnalyzer().get_climate_report())
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    d = request.get_json()
-    code, name = resolve_stock_input(d.get('stock'))
-    if not code: return jsonify({"error":"无法识别股票或股票不存在"})
+    code, name = resolve_stock_input(request.get_json().get('stock', ''))
+    if not code: return jsonify({"error":"输入无效"})
     
     az = StockAnalyzer(code, name)
-    if not az.fetch_data() or not az.calc_indicators(): 
-        return jsonify({"error":"数据获取异常，可能是退市/停牌股票"})
-        
-    latest = az.df.iloc[-1]
-    prev = az.df.iloc[-2]
-    change = (latest['close'] - prev['close']) / prev['close'] * 100
+    if not az.fetch_data() or not az.calc_indicators(): return jsonify({"error":"获取行情失败"})
     
-    # 结合大盘风控与盘中剧本
-    intraday_script = az.generate_intraday_advice()
+    latest, prev = az.df.iloc[-1], az.df.iloc[-2]
+    rfi, stage = az.get_sentiment_state()
+    rank_txt = f"第 {az.sentiment.get('rank')} 名" if az.sentiment.get('rank', 0) > 0 else "百名开外"
     
-    txt = f"📊 基本面数据: 收盘 {latest['close']:.2f} | MA5 {latest['MA5']:.2f} | MA20 {latest['MA20']:.2f}\n\n"
-    txt += intraday_script
-    
-    chart_data = []
-    for _, row in az.df.tail(80).iterrows():
-        chart_data.append({
-            "date": row['date'].strftime("%Y-%m-%d"),
-            "open": row['open'], "high": row['high'],
-            "low": row['low'], "close": row['close'],
-            "ma5": row['MA5'], "ma20": row['MA20'], "volume": row['volume']
-        })
-        
-    return jsonify({
-        "report": {
-            "name": name, "code": code, "price": latest['close'], "change": change,
-            "text_report": txt, "chart_data": chart_data
-        }
-    })
+    # 组合输出
+    script = az.generate_playbook()
+    script += f"\n📡 另类情绪诊断：{stage}\n东财人气排位：{rank_txt}  |  量价狂热指数(RFI)：{rfi}"
 
-@app.route('/backtest_advanced', methods=['POST'])
-def run_bt_advanced():
+    chart_data = [{"date": r['date'], "open": r['open'], "high": r['high'], "low": r['low'], "close": r['close'], "ma20": r['MA20'], "volume": r['volume']} for _, r in az.df.tail(80).iterrows()]
+    
+    return jsonify({"report": {"name": name, "code": code, "price": latest['close'], "change": (latest['close']-prev['close'])/prev['close']*100, "text_report": script, "chart_data": chart_data}})
+
+@app.route('/scan', methods=['POST'])
+def scan():
+    strategy = request.get_json().get('strategy', 'dragon_wave')
+    results = run_strategy_scan(strategy)
+    html = `<h5 class="mb-3 text-white border-bottom border-secondary pb-2">🎯 雷达扫描结果</h5><div class="row g-2">`
+    if not results: html += `<div class="text-secondary">当前市场环境下未扫描到完全匹配该策略的标的。</div>`
+    for r in results:
+        html += f"""<div class="col-md-6"><div class="card p-2 stock-card h-100" onclick="quickAnalyze('{r['code']}')">
+            <div class="d-flex justify-content-between mb-1"><strong class="text-white">{r['name']}</strong><span class="text-warning small">RFI: {r['rfi']}</span></div>
+            <div style="font-size:12px;color:#cbd5e1;">现价: {r['price']} | 建议点位: <span style="color:#fcd34d;">{r['advice']}</span></div>
+        </div></div>"""
+    html += `</div>`
+    return jsonify({"html": html})
+
+@app.route('/portfolio', methods=['POST'])
+def portfolio():
+    holdings = request.get_json().get("holdings", [])
+    txt = "📊 【投资组合穿透风控体检】\n" + "="*40 + "\n"
+    for h in holdings:
+        code, _ = resolve_stock_input(h.get('code',''))
+        if not code: continue
+        az = StockAnalyzer(code, code)
+        if az.fetch_data() and az.calc_indicators():
+            latest = az.df.iloc[-1]
+            cost = safe_float(h.get('cost', 0))
+            pnl = (latest['close'] - cost) / (cost+0.01) * 100 if cost else 0
+            st = az.analyze_strategy()
+            txt += f"🔹 {code} | 现价:{latest['close']:.2f} | 盈亏: {pnl:+.2f}%\n"
+            txt += f"   形态判定: {'🚨 高位风险' if latest['J']>85 else ('✅ 稳健' if st=='none' else '🔥 异动状态')}\n"
+    return jsonify({"html": f"<pre class='terminal-box'>{txt}</pre>"})
+
+@app.route('/backtest', methods=['POST'])
+def run_bt():
     d = request.get_json()
-    stock_input = d.get('stock')
-    start_date = d.get('start_date', '2025-01-01')
+    code, name = resolve_stock_input(d.get('stock', ''))
+    az = StockAnalyzer(code, name)
+    if not az.fetch_data() or not az.calc_indicators(): return jsonify({"error":"数据获取异常"})
     
-    code, name = resolve_stock_input(stock_input)
-    if not code: return jsonify({"error":"无法识别回测股票"})
+    df = az.df
+    signals = []
+    # 模拟寻找符合“缩量回踩”的买点
+    for i in range(50, len(df)-5):
+        row, prev = df.iloc[i], df.iloc[i-1]
+        if row['close'] > row['MA60'] and row['volume'] < row['VMA5'] * 0.8 and row['J'] < 35 and prev['close'] > prev['MA20']:
+            signals.append(dynamic_backtest(df, i + 1))
+            
+    if not signals: return jsonify({"error": "该股历史数据中未触发符合模型的买点信号，无法生成回测。"})
     
-    res = run_advanced_backtest(code, name, start_date)
-    return jsonify(res)
+    summary = {}
+    for st_key in signals[0].keys():
+        rets = [s[st_key]["ret"] for s in signals]
+        days = [s[st_key]["days"] for s in signals]
+        win = sum(1 for r in rets if r > 0) / len(rets) * 100
+        avg_ret = sum(rets) / len(rets) * 100
+        summary[st_key] = {"name": signals[0][st_key]["name"], "win": win, "ret": avg_ret, "days": sum(days)/len(days), "score": win * avg_ret}
+        
+    sorted_st = sorted(summary.values(), key=lambda x: x["score"], reverse=True)
+    medals = ["🥇", "🥈", "🥉", "4", "5"]
+    
+    txt = f"📅 【{name}】AI动态平仓策略寻优\n共捕捉历史同类买入信号 {len(signals)} 次，平行宇宙推演结果：\n"
+    txt += "="*65 + "\n"
+    txt += f"{'排名':<4} | {'退出策略规则':<16} | {'平均收益':<8} | {'历史胜率':<8} | {'平均持仓'}\n"
+    txt += "-"*65 + "\n"
+    for idx, st in enumerate(sorted_st):
+        txt += f"{medals[idx]:<4} | {st['name']:<18} | {st['ret']:>7.2f}% | {st['win']:>7.1f}% | {st['days']:>4.1f} 天\n"
+    txt += "="*65 + "\n"
+    txt += f"💡 系统寻优结论：对该股执行【{sorted_st[0]['name']}】策略可获得最高资金期望效率。"
+    
+    return jsonify({"html": f"<pre class='terminal-box'>{txt}</pre>"})
 
-# ================== 极客深色风前端 UI ==================
+# ================== 前端 UI (融合与升级) ==================
 HTML = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PRO-QUANT V18 终极全功能版</title>
+    <title>PRO-QUANT 旗舰版 V20</title>
     <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.bootcdn.net/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
@@ -417,181 +411,179 @@ HTML = '''<!DOCTYPE html>
         .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5); }
         .card-header-custom { background-color: #0f172a; border-bottom: 1px solid #334155; padding: 14px 20px; font-weight: 700; border-radius: 12px 12px 0 0; color: #f8fafc; }
         input.form-control, select.form-select { background-color: #334155 !important; color: #ffffff !important; border: 1px solid #475569 !important; border-radius: 8px; }
-        input::placeholder { color: #94a3b8 !important; }
         .btn-primary { background-color: #3b82f6; border: none; border-radius: 8px; font-weight: 600; } 
-        .btn-primary:hover { background-color: #2563eb; }
         .btn-success { background-color: #10b981; border: none; border-radius: 8px; font-weight: 600; }
         .terminal-box { background-color: #020617; color: #a7f3d0; font-family: 'Consolas', monospace; padding: 15px; border-radius: 8px; border: 1px solid #334155; font-size: 14px; white-space: pre-wrap; line-height: 1.6; }
-        .climate-panel { border-radius: 12px; padding: 18px 24px; margin-bottom: 24px; border: 1px solid #334155; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); }
-        .text-up { color: #ef4444 !important; } 
-        .text-down { color: #10b981 !important; }
-        #chart-container { height: 480px; width: 100%; margin-top: 20px; display: block; position: relative; }
+        .climate-panel { border-radius: 12px; padding: 18px 24px; margin-bottom: 24px; border: 1px solid #334155; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); }
+        .text-up { color: #ef4444 !important; } .text-down { color: #10b981 !important; }
+        .stock-card { cursor: pointer; transition: 0.2s; } .stock-card:hover { border-color: #10b981; background-color: #334155; }
+        #chart-container { height: 480px; width: 100%; margin-top: 20px; }
     </style>
 </head>
 <body>
 <nav class="navbar navbar-dark mb-4 border-bottom border-secondary" style="background-color: #020617;">
-    <div class="container-fluid"><span class="navbar-brand fw-bold" style="color:#3b82f6; font-size: 22px;">🛰️ PRO-QUANT V18 (动态回测+早盘推演)</span></div>
+    <div class="container-fluid"><span class="navbar-brand fw-bold" style="color:#3b82f6; font-size: 22px;">🛰️ PRO-QUANT 旗舰版 V20 (大盘风控+多重回测寻优)</span></div>
 </nav>
 
 <div class="container-fluid px-4">
     <div class="climate-panel d-flex justify-content-between align-items-center" id="climatePanel">
         <div>
-            <h4 class="mb-2 text-white"><span class="fs-6 text-secondary">上证指数</span> <span id="idxPrice" class="fw-bold">--</span> <span id="idxChange" class="fs-6">--</span></h4>
-            <div class="text-secondary small">
-                情绪指数(J值): <b id="idxJ" class="text-white">--</b> | 
-                市场流动性: <b id="idxAmount" class="text-white">--</b> |
-                游资活跃度: <b id="idxNews" class="text-warning">--</b>
-            </div>
+            <h4 class="mb-2 text-white"><span class="fs-6 text-secondary">上证指数</span> <span id="idxPrice">--</span> <span id="idxChange" class="fs-6">--</span></h4>
+            <div class="text-secondary small">情绪J值: <b id="idxJ" class="text-white">--</b> | 预估成交额: <b id="idxAmount" class="text-white">--</b> | 游资生态: <b id="idxNews" class="text-warning">--</b></div>
         </div>
         <div class="text-end">
             <h3 class="mb-2 fw-bold" id="climateStatus" style="color: #94a3b8;">系统评估中...</h3>
             <div class="text-white fs-5"><span class="text-secondary">AI建议最高仓位:</span> <b id="climatePos" class="text-warning">--</b></div>
         </div>
     </div>
-    <div class="alert alert-dark mb-4 border-secondary text-info" id="climateAdvice" style="background-color: #020617; font-size: 15px;">正在加载全局风控策略...</div>
+    <div class="alert alert-dark mb-4 border-secondary text-info" id="climateAdvice" style="background-color: #020617; font-size: 15px;">加载中...</div>
 
     <div class="row">
         <div class="col-lg-3">
             <div class="card">
                 <div class="card-header-custom">🎯 个股深度分析 & 盘中剧本</div>
                 <div class="card-body">
-                    <input type="text" id="s_code" class="form-control mb-3" placeholder="输入代码或名称 (例: 华电能源)" value="华电能源">
+                    <input type="text" id="s_code" class="form-control mb-3" placeholder="代码/名称 (例: 省广集团)" value="省广集团">
                     <button class="btn btn-primary w-100 py-2" onclick="analyze()">⚡ 生成次日操盘剧本</button>
                 </div>
             </div>
             
             <div class="card">
-                <div class="card-header-custom">🛠️ AI 动态退出策略回测优化</div>
+                <div class="card-header-custom">📡 情绪周期雷达</div>
                 <div class="card-body">
-                    <div class="text-secondary small mb-2">测试不同卖出规则在该股的历史表现</div>
-                    <input type="text" id="bt_code" class="form-control mb-2" placeholder="回测标的 (默认同上)">
-                    <label class="text-secondary small">起始时间 (包含2025至今及2026年数据)</label>
-                    <input type="date" id="bt_start_date" class="form-control mb-3" value="2025-01-01">
-                    <button class="btn btn-success w-100 py-2" onclick="runAdvancedBt()">🧬 启动机器二次优化鉴定</button>
+                    <button class="btn w-100 mb-2 text-white" style="background-color:#b91c1c;" onclick="scan('dragon_wave')">🐉 龙头二波 (龙回头)</button>
+                    <button class="btn btn-outline-warning w-100 mb-2 text-white" onclick="scan('washout')">🛁 缩量洗盘 (黄金坑)</button>
+                    <button class="btn btn-outline-info w-100 text-white" onclick="scan('short')">⚡ 短线突击 (一日游)</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header-custom">🛠️ 组合诊断 & AI 动态回测</div>
+                <div class="card-body">
+                    <div id="ports" class="mb-2">
+                        <div class="d-flex gap-1 mb-1"><input class="form-control form-control-sm p_code" placeholder="代码"><input class="form-control form-control-sm p_cost" placeholder="成本"></div>
+                    </div>
+                    <div class="d-flex justify-content-between mb-3">
+                        <button class="btn btn-sm btn-outline-secondary text-white" onclick="addPort()">+ 新增</button>
+                        <button class="btn btn-sm btn-info text-white" onclick="calcPort()">持仓体检</button>
+                    </div>
+                    <hr class="border-secondary">
+                    <div class="text-secondary small mb-2">测试多种卖出规则的历史效率对比</div>
+                    <button class="btn btn-success w-100 py-2" onclick="runBt()">🧬 启动机器二次优化鉴定</button>
                 </div>
             </div>
         </div>
 
         <div class="col-lg-9">
             <div class="card" style="min-height: 800px;">
-                <div class="card-header-custom d-flex justify-content-between align-items-center">
-                    <span>📺 可视化情报看板</span>
-                    <span id="loader" style="display:none; color:#3b82f6;">
-                        <div class="spinner-border spinner-border-sm mr-2" role="status"></div> 核心算力调度中...
-                    </span>
+                <div class="card-header-custom d-flex justify-content-between">
+                    <span>📺 可视化情报看板</span><span id="loader" style="display:none; color:#3b82f6;">引擎推演中...</span>
                 </div>
-                <div class="card-body" id="displayArea">
-                    <div class="text-center mt-5 pt-5" style="color: #475569;">
-                        <h2 class="mb-3">系统已就绪</h2>
-                        <p>请在左侧输入标的，生成盘中交易剧本或启动机器回测优化。</p>
-                    </div>
-                </div>
+                <div class="card-body" id="displayArea"><div class="text-center mt-5 pt-5" style="color: #475569;"><h2 class="mb-3">系统已就绪</h2><p>请在左侧输入标的，生成盘中交易剧本或启动机器回测优化。</p></div></div>
             </div>
         </div>
     </div>
 </div>
 
 <script>
+    let kChart = null;
     window.onload = async function() {
         try {
-            const res = await fetch('/climate');
-            const data = await res.json();
+            const data = await fetch('/climate').then(r=>r.json());
             document.getElementById('idxPrice').innerText = data.index_price;
             document.getElementById('idxChange').innerText = data.change;
             document.getElementById('idxChange').className = data.change.includes('+') ? 'text-up fs-5 ms-2' : 'text-down fs-5 ms-2';
             document.getElementById('idxJ').innerText = data.j_val;
             document.getElementById('idxAmount').innerText = data.amount;
             document.getElementById('idxNews').innerText = data.news_sentiment;
-            
             document.getElementById('climateStatus').innerText = data.status;
-            const colorMap = {"success":"#10b981", "warning":"#f59e0b", "danger":"#ef4444", "info":"#38bdf8", "secondary":"#94a3b8"};
-            document.getElementById('climateStatus').style.color = colorMap[data.color] || "#fff";
+            document.getElementById('climateStatus').style.color = {"success":"#10b981", "warning":"#f59e0b", "danger":"#ef4444", "info":"#38bdf8"}[data.color] || "#fff";
             document.getElementById('climatePos').innerText = data.position;
             document.getElementById('climateAdvice').innerHTML = `<b>💡 大局观风控体系：</b> ${data.advice}`;
-        } catch(e) { console.log("大盘加载失败"); }
+        } catch(e) {}
     };
+
+    function addPort() {
+        const div = document.createElement('div'); div.className = 'd-flex gap-1 mb-1';
+        div.innerHTML = '<input class="form-control form-control-sm p_code" placeholder="代码"><input class="form-control form-control-sm p_cost" placeholder="成本">';
+        document.getElementById('ports').appendChild(div);
+    }
 
     async function analyze() {
         const stock = document.getElementById('s_code').value;
-        document.getElementById('bt_code').value = stock; // 同步给回测输入框
         if(!stock) return;
         if(kChart) { kChart.destroy(); kChart = null; } 
-        
         document.getElementById('loader').style.display = 'block';
         try {
-            const res = await fetch('/analyze', {
-                method: 'POST', headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({stock})
-            });
-            const data = await res.json();
+            const data = await fetch('/analyze', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({stock}) }).then(r=>r.json());
             document.getElementById('loader').style.display = 'none';
             if(data.error) { document.getElementById('displayArea').innerHTML = `<div class="alert alert-danger mx-3 mt-3">❌ ${data.error}</div>`; return; }
             
             const r = data.report;
-            const color = r.change >= 0 ? 'text-up' : 'text-down';
-            
             document.getElementById('displayArea').innerHTML = `
             <div class="d-flex justify-content-between align-items-end mb-4 px-2">
                 <h2 class="text-white mb-0 fw-bold">${r.name} <span class="fs-5" style="color:#94a3b8;">${r.code}</span></h2>
-                <h1 class="${color} mb-0 fw-bold">${r.price.toFixed(2)} <span class="fs-4">${r.change >= 0 ? '+'+r.change : r.change}%</span></h1>
+                <h1 class="${r.change>=0?'text-up':'text-down'} mb-0 fw-bold">${r.price.toFixed(2)} <span class="fs-4">${r.change>=0?'+':''}${r.change.toFixed(2)}%</span></h1>
             </div>
-            
-            <div class="mb-4">
-                <pre class="terminal-box" style="font-size: 16px;">${r.text_report}</pre>
-            </div>
-            
+            <pre class="terminal-box" style="font-size: 16px;">${r.text_report}</pre>
             <div id="chart-container"></div>`;
             setTimeout(() => { renderChart(r.chart_data); }, 100);
-        } catch(e) {
-            document.getElementById('loader').style.display = 'none';
-        }
+        } catch(e) { document.getElementById('loader').style.display = 'none'; }
     }
 
     function renderChart(data) {
-        if(!data || data.length === 0) return;
-        const kLineData = data.map(i => ({ x: new Date(i.date).getTime(), y: [i.open, i.high, i.low, i.close] }));
-        const ma20Data = data.map(i => ({ x: new Date(i.date).getTime(), y: i.ma20 }));
-        const volData = data.map(i => ({ x: new Date(i.date).getTime(), y: i.volume, fillColor: i.close >= i.open ? 'rgba(239,68,68,0.5)' : 'rgba(16,185,129,0.5)' }));
-
+        if(!data || !data.length) return;
         const options = {
-            series: [ { name: 'K线', type: 'candlestick', data: kLineData }, { name: 'MA20', type: 'line', data: ma20Data }, { name: '成交量', type: 'column', data: volData } ],
+            series: [ { name: 'K线', type: 'candlestick', data: data.map(i => ({x: new Date(i.date).getTime(), y: [i.open, i.high, i.low, i.close]})) },
+                      { name: 'MA20', type: 'line', data: data.map(i => ({x: new Date(i.date).getTime(), y: i.ma20})) },
+                      { name: '成交量', type: 'column', data: data.map(i => ({x: new Date(i.date).getTime(), y: i.volume, fillColor: i.close>=i.open?'#ef4444':'#10b981'})) } ],
             chart: { height: 480, type: 'line', background: 'transparent', toolbar: { show: false } },
             theme: { mode: 'dark' }, stroke: { width: [1, 2, 1], curve: 'smooth' }, colors: ['#fff', '#3b82f6', '#fff'],
-            plotOptions: { candlestick: { colors: { upward: '#ef4444', downward: '#10b981' }, wick: { useFillColor: true } }, bar: { columnWidth: '80%' } },
+            plotOptions: { candlestick: { colors: { upward: '#ef4444', downward: '#10b981' } }, bar: { columnWidth: '80%' } },
             xaxis: { type: 'datetime', labels: { style: { colors: '#94a3b8' } } },
-            yaxis: [ { seriesName: 'K线', title: { text: '价格', style: { color: '#64748b' } }, labels: { style: { colors: '#94a3b8' }, formatter: val => val ? val.toFixed(2) : "" } },
-                     { seriesName: 'K线', show: false },
-                     { seriesName: '成交量', opposite: true, title: { text: '成交量(手)', style: { color: '#64748b' } }, labels: { style: { colors: '#94a3b8' }, formatter: val => val ? (val/10000).toFixed(0) + 'w' : "" } } ],
-            grid: { borderColor: '#334155', strokeDashArray: 3 }, legend: { position: 'top', horizontalAlign: 'left', labels: { colors: '#f8fafc' } }
+            yaxis: [ { seriesName: 'K线', title: { text: '价格' }, labels: { formatter: val => val ? val.toFixed(2) : "" } }, { show: false },
+                     { seriesName: '成交量', opposite: true, title: { text: '成交量' }, labels: { formatter: val => val ? (val/10000).toFixed(0)+'w' : "" } } ],
+            grid: { borderColor: '#334155', strokeDashArray: 3 }
         };
         kChart = new ApexCharts(document.querySelector("#chart-container"), options);
         kChart.render();
     }
 
-    async function runAdvancedBt() {
-        const stock = document.getElementById('bt_code').value || document.getElementById('s_code').value;
-        const start_date = document.getElementById('bt_start_date').value;
-        
-        if(!stock) { alert("请先输入股票"); return; }
-        
+    async function scan(strategy) {
         document.getElementById('loader').style.display = 'block';
         try {
-            const res = await fetch('/backtest_advanced', { 
-                method: 'POST', headers: {'Content-Type':'application/json'}, 
-                body: JSON.stringify({stock, start_date}) 
-            });
-            const data = await res.json();
+            const data = await fetch('/scan', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({strategy}) }).then(r=>r.json());
+            document.getElementById('loader').style.display = 'none';
+            document.getElementById('displayArea').innerHTML = data.html;
+        } catch(e) { document.getElementById('loader').style.display = 'none'; }
+    }
+    
+    function quickAnalyze(code) { document.getElementById('s_code').value = code; analyze(); }
+
+    async function calcPort() {
+        const rows = document.querySelectorAll('#ports .d-flex');
+        const holdings = [];
+        rows.forEach(r => {
+            const code = r.querySelector('.p_code').value.trim(), cost = r.querySelector('.p_cost').value;
+            if(code) holdings.push({code, cost: cost||0});
+        });
+        document.getElementById('loader').style.display = 'block';
+        const data = await fetch('/portfolio', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({holdings}) }).then(r=>r.json());
+        document.getElementById('loader').style.display = 'none';
+        document.getElementById('displayArea').innerHTML = data.html;
+    }
+
+    async function runBt() {
+        const stock = document.getElementById('s_code').value;
+        if(!stock) return;
+        document.getElementById('loader').style.display = 'block';
+        try {
+            const data = await fetch('/backtest', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({stock}) }).then(r=>r.json());
             document.getElementById('loader').style.display = 'none';
             if(data.error) { document.getElementById('displayArea').innerHTML = `<div class="alert alert-warning mt-3 mx-3">⚠️ ${data.error}</div>`; return; }
-            
-            document.getElementById('displayArea').innerHTML = `<div class="px-2"><h4 class="text-white border-bottom border-secondary pb-3 mb-4">🧬 AI 动态平仓策略优化报告</h4><pre class="terminal-box" style="font-size:15px; color:#60a5fa;">${data.report}</pre></div>`;
+            document.getElementById('displayArea').innerHTML = data.html;
         } catch(e) { document.getElementById('loader').style.display = 'none'; }
     }
 </script>
 </body>
-</html>'''
-
-if __name__ == '__main__':
-    print("🚀 PRO-QUANT V18 终极版引擎已启动！(支持早盘推演与动态回测优化)")
-    print("👉 浏览器访问 http://127.0.0.1:10000")
-    app.run(host='0.0.0.0', port=10000)
+</html>
