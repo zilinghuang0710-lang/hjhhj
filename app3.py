@@ -241,17 +241,17 @@ class StockAnalyzer:
         script += f"➤ 强转弱诱多：若直接高开 >6% 但竞价无量，极易被砸成诱多长上影，持股者逢高兑现，切忌打板。\n"
         return script
 
-# ================== 机器动态回测与组合模块 ==================
+# ================== AI 动态回测寻优引擎 ==================
 def dynamic_backtest(df, buy_idx, hold_days=5):
-    """运用原V5版的先进Lambda评估思路进行实盘演练"""
+    """运用动态退出的平行推演"""
     buy_price = df.iloc[buy_idx]['open']
     if buy_price <= 0: return None
     
     rules = {
         "fixed_5d": {"ret": 0, "days": 0, "name": "固定持仓5天"},
-        "ma5_break": {"ret": 0, "days": 0, "name": "破 MA5 出局"},
-        "ma10_break": {"ret": 0, "days": 0, "name": "破 MA10 出局"},
-        "trailing_15": {"ret": 0, "days": 0, "name": "最高回撤 15%"},
+        "ma5_break": {"ret": 0, "days": 0, "name": "跌破MA5出局"},
+        "ma10_break": {"ret": 0, "days": 0, "name": "跌破MA10出局"},
+        "trailing_15": {"ret": 0, "days": 0, "name": "最高回撤15%止盈"},
         "hybrid": {"ret": 0, "days": 0, "name": "破MA5或回撤15%"}
     }
     
@@ -317,9 +317,9 @@ def analyze():
     
     latest, prev = az.df.iloc[-1], az.df.iloc[-2]
     rfi, stage = az.get_sentiment_state()
-    rank_txt = f"第 {az.sentiment.get('rank')} 名" if az.sentiment.get('rank', 0) > 0 else "百名开外"
+    rank_txt = f"人气排名：第 {az.sentiment.get('rank')} 名" if az.sentiment.get('rank', 0) > 0 else "人气排名：百名开外"
     
-    # 组合输出
+    # 早盘剧本
     script = az.generate_playbook()
     script += f"\n📡 另类情绪诊断：{stage}\n东财人气排位：{rank_txt}  |  量价狂热指数(RFI)：{rfi}"
 
@@ -331,14 +331,17 @@ def analyze():
 def scan():
     strategy = request.get_json().get('strategy', 'dragon_wave')
     results = run_strategy_scan(strategy)
-    html = `<h5 class="mb-3 text-white border-bottom border-secondary pb-2">🎯 雷达扫描结果</h5><div class="row g-2">`
-    if not results: html += `<div class="text-secondary">当前市场环境下未扫描到完全匹配该策略的标的。</div>`
+    
+    # 彻底修复原先的 JavaScript 字符串反引号 SyntaxError 崩溃问题，改用标准的 Python f-string
+    html = '<h5 class="mb-3 text-white border-bottom border-secondary pb-2">🎯 雷达扫描结果</h5><div class="row g-2">'
+    if not results: 
+        html += '<div class="text-secondary">当前市场环境下未扫描到完全匹配该策略的标的。</div>'
     for r in results:
         html += f"""<div class="col-md-6"><div class="card p-2 stock-card h-100" onclick="quickAnalyze('{r['code']}')">
             <div class="d-flex justify-content-between mb-1"><strong class="text-white">{r['name']}</strong><span class="text-warning small">RFI: {r['rfi']}</span></div>
             <div style="font-size:12px;color:#cbd5e1;">现价: {r['price']} | 建议点位: <span style="color:#fcd34d;">{r['advice']}</span></div>
         </div></div>"""
-    html += `</div>`
+    html += '</div>'
     return jsonify({"html": html})
 
 @app.route('/portfolio', methods=['POST'])
@@ -360,8 +363,7 @@ def portfolio():
 
 @app.route('/backtest', methods=['POST'])
 def run_bt():
-    d = request.get_json()
-    code, name = resolve_stock_input(d.get('stock', ''))
+    code, name = resolve_stock_input(request.get_json().get('stock', ''))
     az = StockAnalyzer(code, name)
     if not az.fetch_data() or not az.calc_indicators(): return jsonify({"error":"数据获取异常"})
     
@@ -397,12 +399,12 @@ def run_bt():
     
     return jsonify({"html": f"<pre class='terminal-box'>{txt}</pre>"})
 
-# ================== 前端 UI (融合与升级) ==================
+# ================== 前端 UI ==================
 HTML = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PRO-QUANT 旗舰版 V20</title>
+    <title>PRO-QUANT 终极版</title>
     <link href="https://cdn.bootcdn.net/ajax/libs/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.bootcdn.net/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
@@ -410,7 +412,7 @@ HTML = '''<!DOCTYPE html>
         body { background-color: #0b0f19; color: #f1f5f9; font-family: -apple-system, sans-serif; }
         .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5); }
         .card-header-custom { background-color: #0f172a; border-bottom: 1px solid #334155; padding: 14px 20px; font-weight: 700; border-radius: 12px 12px 0 0; color: #f8fafc; }
-        input.form-control, select.form-select { background-color: #334155 !important; color: #ffffff !important; border: 1px solid #475569 !important; border-radius: 8px; }
+        input.form-control { background-color: #334155 !important; color: #ffffff !important; border: 1px solid #475569 !important; border-radius: 8px; }
         .btn-primary { background-color: #3b82f6; border: none; border-radius: 8px; font-weight: 600; } 
         .btn-success { background-color: #10b981; border: none; border-radius: 8px; font-weight: 600; }
         .terminal-box { background-color: #020617; color: #a7f3d0; font-family: 'Consolas', monospace; padding: 15px; border-radius: 8px; border: 1px solid #334155; font-size: 14px; white-space: pre-wrap; line-height: 1.6; }
@@ -422,18 +424,18 @@ HTML = '''<!DOCTYPE html>
 </head>
 <body>
 <nav class="navbar navbar-dark mb-4 border-bottom border-secondary" style="background-color: #020617;">
-    <div class="container-fluid"><span class="navbar-brand fw-bold" style="color:#3b82f6; font-size: 22px;">🛰️ PRO-QUANT 旗舰版 V20 (大盘风控+多重回测寻优)</span></div>
+    <div class="container-fluid"><span class="navbar-brand fw-bold" style="color:#3b82f6; font-size: 22px;">🛰️ PRO-QUANT 终极版 (真情绪融合+机器优选)</span></div>
 </nav>
 
 <div class="container-fluid px-4">
     <div class="climate-panel d-flex justify-content-between align-items-center" id="climatePanel">
         <div>
             <h4 class="mb-2 text-white"><span class="fs-6 text-secondary">上证指数</span> <span id="idxPrice">--</span> <span id="idxChange" class="fs-6">--</span></h4>
-            <div class="text-secondary small">情绪J值: <b id="idxJ" class="text-white">--</b> | 预估成交额: <b id="idxAmount" class="text-white">--</b> | 游资生态: <b id="idxNews" class="text-warning">--</b></div>
+            <div class="text-secondary small">大盘情绪J值: <b id="idxJ" class="text-white">--</b> | 市场流动性: <b id="idxAmount" class="text-white">--</b> | 游资生态: <b id="idxNews" class="text-warning">--</b></div>
         </div>
         <div class="text-end">
             <h3 class="mb-2 fw-bold" id="climateStatus" style="color: #94a3b8;">系统评估中...</h3>
-            <div class="text-white fs-5"><span class="text-secondary">AI建议最高仓位:</span> <b id="climatePos" class="text-warning">--</b></div>
+            <div class="text-white fs-5"><span class="text-secondary">AI风控仓位建议:</span> <b id="climatePos" class="text-warning">--</b></div>
         </div>
     </div>
     <div class="alert alert-dark mb-4 border-secondary text-info" id="climateAdvice" style="background-color: #020617; font-size: 15px;">加载中...</div>
@@ -443,7 +445,7 @@ HTML = '''<!DOCTYPE html>
             <div class="card">
                 <div class="card-header-custom">🎯 个股深度分析 & 盘中剧本</div>
                 <div class="card-body">
-                    <input type="text" id="s_code" class="form-control mb-3" placeholder="代码/名称 (例: 省广集团)" value="省广集团">
+                    <input type="text" id="s_code" class="form-control mb-3" placeholder="代码/名称 (例: 华电能源)" value="华电能源">
                     <button class="btn btn-primary w-100 py-2" onclick="analyze()">⚡ 生成次日操盘剧本</button>
                 </div>
             </div>
@@ -451,7 +453,7 @@ HTML = '''<!DOCTYPE html>
             <div class="card">
                 <div class="card-header-custom">📡 情绪周期雷达</div>
                 <div class="card-body">
-                    <button class="btn w-100 mb-2 text-white" style="background-color:#b91c1c;" onclick="scan('dragon_wave')">🐉 龙头二波 (龙回头)</button>
+                    <button class="btn w-100 mb-2 text-white" style="background-color:#b91c1c; border:none;" onclick="scan('dragon_wave')">🐉 龙头二波 (龙回头)</button>
                     <button class="btn btn-outline-warning w-100 mb-2 text-white" onclick="scan('washout')">🛁 缩量洗盘 (黄金坑)</button>
                     <button class="btn btn-outline-info w-100 text-white" onclick="scan('short')">⚡ 短线突击 (一日游)</button>
                 </div>
@@ -587,3 +589,9 @@ HTML = '''<!DOCTYPE html>
 </script>
 </body>
 </html>
+'''
+
+if __name__ == '__main__':
+    print("🚀 PRO-QUANT 终极版已启动！")
+    print("👉 请用浏览器访问: http://127.0.0.1:10000")
+    app.run(host='0.0.0.0', port=10000)
